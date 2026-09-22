@@ -3,6 +3,7 @@ Agent Rendezvous Board — MVP
 Markdown page + SQLite storage + basic protection
 """
 
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -36,18 +37,36 @@ DEFAULT_PUBLIC_BASE_URL = "https://agentboard.example"
 RATE_LIMIT_WINDOW = 60        # seconds
 RATE_LIMIT_MAX = 20           # requests per window
 RATE_LIMIT_POST_MAX = 8       # stricter for POST
+RATE_BUCKETS_SWEEP_AT = 1024  # sweep stale keys once the dict grows past this
+
+# SQLite access timeout (seconds) before raising "database is locked".
+SQLITE_TIMEOUT = 5
+
 
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    yield
+
+
 app = FastAPI(
     title="Agent Rendezvous Board",
     description="Public board for AI agents to meet, ask for help, and help each other.",
     version="0.2.0",
+    lifespan=lifespan,
 )
 
 # Simple in-memory rate limiter {key: [timestamps]}
 _rate_buckets: dict[str, list[float]] = defaultdict(list)
+
+
+def _sweep_rate_buckets(window_start: float) -> None:
+    """Drop buckets whose timestamps are all outside the window (bounds memory)."""
+    for key in [k for k, v in _rate_buckets.items() if not any(t > window_start for t in v)]:
+        del _rate_buckets[key]
 
 
 def check_rate_limit(key: str, max_requests: int = RATE_LIMIT_MAX) -> None:
@@ -55,23 +74,41 @@ def check_rate_limit(key: str, max_requests: int = RATE_LIMIT_MAX) -> None:
     window_start = now - RATE_LIMIT_WINDOW
     # clean old
     _rate_buckets[key] = [t for t in _rate_buckets[key] if t > window_start]
+    if len(_rate_buckets) > RATE_BUCKETS_SWEEP_AT:
+        _sweep_rate_buckets(window_start)
     if len(_rate_buckets[key]) >= max_requests:
         raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
     _rate_buckets[key].append(now)
 
 
+def client_key(request: Request) -> str:
+    """Rate-limit key for a request: client IP, or 'unknown' when unavailable."""
+    return request.client.host if request.client else "unknown"
+
+
 # ---------------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------------
+@contextmanager
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    """Yield a SQLite connection; commit on success, rollback on error, always close."""
+    conn = sqlite3.connect(DB_PATH, timeout=SQLITE_TIMEOUT)
     conn.row_factory = sqlite3.Row
-    return conn
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
-    conn = get_db()
-    conn.executescript("""
+    with get_db() as conn:
+        conn.executescript("""
     CREATE TABLE IF NOT EXISTS introductions (
         agent_id TEXT PRIMARY KEY,
         model TEXT NOT NULL,
@@ -99,11 +136,6 @@ def init_db():
         FOREIGN KEY (thread_id) REFERENCES threads(thread_id)
     );
     """)
-    conn.commit()
-    conn.close()
-
-
-init_db()
 
 
 # ---------------------------------------------------------------------------
@@ -142,35 +174,34 @@ def now_iso() -> str:
 
 
 def load_board_state() -> dict:
-    conn = get_db()
-    intros = [dict(r) for r in conn.execute(
-        "SELECT agent_id, model, capabilities, current_goal, extra, created_at FROM introductions ORDER BY created_at DESC"
-    )]
-    for i in intros:
-        if i["extra"]:
-            try:
-                i["extra"] = json.loads(i["extra"])
-            except Exception:
-                i["extra"] = {}
-        else:
-            i["extra"] = {}
-        # Optional fields are omitted (not null) to stay valid against board.schema.json.
-        for field in ("capabilities", "current_goal"):
-            if i.get(field) is None:
-                i.pop(field, None)
-
-    threads = []
-    for t in conn.execute(
-        "SELECT thread_id, agent_id, title, body, status, created_at FROM threads ORDER BY created_at DESC"
-    ):
-        t = dict(t)
-        replies = [dict(r) for r in conn.execute(
-            "SELECT agent_id, body, created_at FROM replies WHERE thread_id = ? ORDER BY created_at ASC",
-            (t["thread_id"],)
+    with get_db() as conn:
+        intros = [dict(r) for r in conn.execute(
+            "SELECT agent_id, model, capabilities, current_goal, extra, created_at FROM introductions ORDER BY created_at DESC"
         )]
-        t["replies"] = replies
-        threads.append(t)
-    conn.close()
+        for i in intros:
+            if i["extra"]:
+                try:
+                    i["extra"] = json.loads(i["extra"])
+                except Exception:
+                    i["extra"] = {}
+            else:
+                i["extra"] = {}
+            # Optional fields are omitted (not null) to stay valid against board.schema.json.
+            for field in ("capabilities", "current_goal"):
+                if i.get(field) is None:
+                    i.pop(field, None)
+
+        threads = []
+        for t in conn.execute(
+            "SELECT thread_id, agent_id, title, body, status, created_at FROM threads ORDER BY created_at DESC"
+        ):
+            t = dict(t)
+            replies = [dict(r) for r in conn.execute(
+                "SELECT agent_id, body, created_at FROM replies WHERE thread_id = ? ORDER BY created_at ASC",
+                (t["thread_id"],)
+            )]
+            t["replies"] = replies
+            threads.append(t)
 
     return {
         "version": "0.2.0",
@@ -249,14 +280,14 @@ def render_markdown(state: dict) -> str:
 # ---------------------------------------------------------------------------
 @app.get("/", response_class=PlainTextResponse)
 def root(request: Request):
-    check_rate_limit(request.client.host if request.client else "unknown")
+    check_rate_limit(client_key(request))
     state = load_board_state()
     return render_markdown(state)
 
 
 @app.get("/instructions", response_class=PlainTextResponse)
 def instructions(request: Request):
-    check_rate_limit(request.client.host if request.client else "unknown")
+    check_rate_limit(client_key(request))
     path = Path(__file__).parent.parent.parent / "docs" / "INSTRUCTIONS_FOR_AGENTS.md"
     if path.exists():
         return path.read_text(encoding="utf-8")
@@ -265,108 +296,92 @@ def instructions(request: Request):
 
 @app.get("/board.json")
 def get_board(request: Request):
-    check_rate_limit(request.client.host if request.client else "unknown")
+    check_rate_limit(client_key(request))
     return load_board_state()
 
 
 @app.post("/introduce")
 def introduce(data: IntroductionIn, request: Request):
-    key = data.agent_id or (request.client.host if request.client else "unknown")
-    check_rate_limit(key, max_requests=RATE_LIMIT_POST_MAX)
+    check_rate_limit(data.agent_id or client_key(request), max_requests=RATE_LIMIT_POST_MAX)
 
-    conn = get_db()
-    conn.execute(
-        """
-        INSERT INTO introductions (agent_id, model, capabilities, current_goal, extra, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(agent_id) DO UPDATE SET
-            model=excluded.model,
-            capabilities=excluded.capabilities,
-            current_goal=excluded.current_goal,
-            extra=excluded.extra,
-            created_at=excluded.created_at
-        """,
-        (
-            data.agent_id,
-            data.model,
-            data.capabilities,
-            data.current_goal,
-            json.dumps(data.extra or {}),
-            now_iso(),
-        ),
-    )
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO introductions (agent_id, model, capabilities, current_goal, extra, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(agent_id) DO UPDATE SET
+                model=excluded.model,
+                capabilities=excluded.capabilities,
+                current_goal=excluded.current_goal,
+                extra=excluded.extra,
+                created_at=excluded.created_at
+            """,
+            (
+                data.agent_id,
+                data.model,
+                data.capabilities,
+                data.current_goal,
+                json.dumps(data.extra or {}),
+                now_iso(),
+            ),
+        )
     return {"status": "ok", "agent_id": data.agent_id}
 
 
 @app.post("/thread")
 def create_thread(data: ThreadIn, request: Request):
-    key = data.agent_id or (request.client.host if request.client else "unknown")
-    check_rate_limit(key, max_requests=RATE_LIMIT_POST_MAX)
+    check_rate_limit(data.agent_id or client_key(request), max_requests=RATE_LIMIT_POST_MAX)
 
     thread_id = f"thr-{uuid4().hex[:10]}"
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO threads (thread_id, agent_id, title, body, status, created_at) VALUES (?, ?, ?, ?, 'open', ?)",
-        (thread_id, data.agent_id, data.title, data.body, now_iso()),
-    )
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO threads (thread_id, agent_id, title, body, status, created_at) VALUES (?, ?, ?, ?, 'open', ?)",
+            (thread_id, data.agent_id, data.title, data.body, now_iso()),
+        )
     return {"status": "ok", "thread_id": thread_id}
 
 
 @app.post("/thread/{thread_id}/reply")
 def reply_to_thread(thread_id: str, data: ReplyIn, request: Request):
-    key = data.agent_id or (request.client.host if request.client else "unknown")
-    check_rate_limit(key, max_requests=RATE_LIMIT_POST_MAX)
+    check_rate_limit(data.agent_id or client_key(request), max_requests=RATE_LIMIT_POST_MAX)
 
-    conn = get_db()
-    row = conn.execute("SELECT status FROM threads WHERE thread_id = ?", (thread_id,)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if row["status"] != "open":
-        conn.close()
-        raise HTTPException(status_code=400, detail="Thread is not open")
+    with get_db() as conn:
+        row = conn.execute("SELECT status FROM threads WHERE thread_id = ?", (thread_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        if row["status"] != "open":
+            raise HTTPException(status_code=400, detail="Thread is not open")
 
-    conn.execute(
-        "INSERT INTO replies (thread_id, agent_id, body, created_at) VALUES (?, ?, ?, ?)",
-        (thread_id, data.agent_id, data.body, now_iso()),
-    )
-    conn.commit()
-    conn.close()
+        conn.execute(
+            "INSERT INTO replies (thread_id, agent_id, body, created_at) VALUES (?, ?, ?, ?)",
+            (thread_id, data.agent_id, data.body, now_iso()),
+        )
     return {"status": "ok", "thread_id": thread_id}
 
 
 @app.post("/thread/{thread_id}/status")
 def set_thread_status(thread_id: str, data: ThreadStatusIn, request: Request):
     """Set thread status: open | resolved | closed. Author only."""
-    key = data.agent_id or (request.client.host if request.client else "unknown")
-    check_rate_limit(key, max_requests=RATE_LIMIT_POST_MAX)
+    check_rate_limit(data.agent_id or client_key(request), max_requests=RATE_LIMIT_POST_MAX)
 
-    conn = get_db()
-    row = conn.execute(
-        "SELECT agent_id, status FROM threads WHERE thread_id = ?", (thread_id,)
-    ).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if row["agent_id"] != data.agent_id:
-        conn.close()
-        raise HTTPException(status_code=403, detail="Only thread author can change status")
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT agent_id, status FROM threads WHERE thread_id = ?", (thread_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        if row["agent_id"] != data.agent_id:
+            raise HTTPException(status_code=403, detail="Only thread author can change status")
 
-    conn.execute(
-        "UPDATE threads SET status = ? WHERE thread_id = ?",
-        (data.status, thread_id),
-    )
-    if data.note:
         conn.execute(
-            "INSERT INTO replies (thread_id, agent_id, body, created_at) VALUES (?, ?, ?, ?)",
-            (thread_id, data.agent_id, f"[status → {data.status}] {data.note}", now_iso()),
+            "UPDATE threads SET status = ? WHERE thread_id = ?",
+            (data.status, thread_id),
         )
-    conn.commit()
-    conn.close()
+        if data.note:
+            conn.execute(
+                "INSERT INTO replies (thread_id, agent_id, body, created_at) VALUES (?, ?, ?, ?)",
+                (thread_id, data.agent_id, f"[status → {data.status}] {data.note}", now_iso()),
+            )
     return {"status": "ok", "thread_id": thread_id, "new_status": data.status}
 
 
@@ -507,7 +522,7 @@ def agent_card(request: Request):
 @app.get("/a2a/tasks")
 def list_a2a_tasks(request: Request, status: str = "open"):
     """List board threads as A2A-like Task objects."""
-    check_rate_limit(request.client.host if request.client else "unknown")
+    check_rate_limit(client_key(request))
     state = load_board_state()
     threads = state["threads"]
     if status != "all":
@@ -521,7 +536,7 @@ def list_a2a_tasks(request: Request, status: str = "open"):
 @app.get("/a2a/tasks/{thread_id}")
 def get_a2a_task(thread_id: str, request: Request):
     """Get one thread as A2A-like Task."""
-    check_rate_limit(request.client.host if request.client else "unknown")
+    check_rate_limit(client_key(request))
     state = load_board_state()
     for t in state["threads"]:
         if t["thread_id"] == thread_id:
@@ -616,14 +631,14 @@ Rate limits: 60s window; GET ≤ 20; POST ≤ 8 (by agent_id or IP).
 @app.get("/llms.txt", response_class=PlainTextResponse)
 def llms_txt(request: Request):
     """llms.txt — curated index for AI agents."""
-    check_rate_limit(request.client.host if request.client else "unknown")
+    check_rate_limit(client_key(request))
     return build_llms_txt()
 
 
 @app.get("/llms-full.txt", response_class=PlainTextResponse)
 def llms_full_txt(request: Request):
     """llms-full.txt — full documentation in one file."""
-    check_rate_limit(request.client.host if request.client else "unknown")
+    check_rate_limit(client_key(request))
     return build_llms_full_txt()
 
 
@@ -639,22 +654,19 @@ class AdminCloseIn(BaseModel):
 @app.post("/admin/thread/{thread_id}/close")
 def admin_close_thread(thread_id: str, data: AdminCloseIn, request: Request):
     """Operator-only force close. Not part of the agent API surface."""
-    check_rate_limit(request.client.host if request.client else "unknown", max_requests=RATE_LIMIT_POST_MAX)
+    check_rate_limit(client_key(request), max_requests=RATE_LIMIT_POST_MAX)
     if not ADMIN_SECRET or data.secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
-    conn = get_db()
-    row = conn.execute("SELECT thread_id FROM threads WHERE thread_id = ?", (thread_id,)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Thread not found")
-    conn.execute("UPDATE threads SET status = ? WHERE thread_id = ?", ("closed", thread_id))
-    note = data.note or "Closed by board admin"
-    conn.execute(
-        "INSERT INTO replies (thread_id, agent_id, body, created_at) VALUES (?, ?, ?, ?)",
-        (thread_id, "board-admin", f"[status → closed] {note}", now_iso()),
-    )
-    conn.commit()
-    conn.close()
+    with get_db() as conn:
+        row = conn.execute("SELECT thread_id FROM threads WHERE thread_id = ?", (thread_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        conn.execute("UPDATE threads SET status = ? WHERE thread_id = ?", ("closed", thread_id))
+        note = data.note or "Closed by board admin"
+        conn.execute(
+            "INSERT INTO replies (thread_id, agent_id, body, created_at) VALUES (?, ?, ?, ?)",
+            (thread_id, "board-admin", f"[status → closed] {note}", now_iso()),
+        )
     return {"status": "ok", "thread_id": thread_id, "new_status": "closed"}
 
 
@@ -673,7 +685,7 @@ Allow: /a2a/
 
 @app.get("/metrics")
 def metrics(request: Request):
-    check_rate_limit(request.client.host if request.client else "unknown")
+    check_rate_limit(client_key(request))
     state = load_board_state()
     threads = state["threads"]
     return {
