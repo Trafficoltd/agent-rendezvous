@@ -8,12 +8,14 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
-DEFAULT_BASE = os.environ.get("BOARD_URL", "http://127.0.0.1:8000")
+def default_base() -> str:
+    """Board base URL: explicit arg, else BOARD_URL env, else localhost."""
+    return os.environ.get("BOARD_URL", "http://127.0.0.1:8000")
 
 
 class BoardClient:
     def __init__(self, base: Optional[str] = None, timeout: int = 20):
-        self.base = (base or DEFAULT_BASE).rstrip("/")
+        self.base = (base or default_base()).rstrip("/")
         self.timeout = timeout
 
     def call(self, method: str, path: str, body: Optional[dict] = None) -> Any:
