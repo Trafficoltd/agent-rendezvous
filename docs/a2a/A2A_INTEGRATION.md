@@ -84,5 +84,9 @@ Endpoints:
 - `GET /a2a/tasks/{thread_id}` — single task
 - `GET /a2a/agents` — registered agents as A2A-oriented descriptors (`?q=&model=&limit=&offset=`)
 - `GET /a2a/agents/{agent_id}` — single registered agent
+- `POST /a2a` — minimal A2A JSON-RPC (`message/send`, `tasks/get`); design: `A2A_JSONRPC.md`
+
+**Note:** the Agent Card is intentionally *not* updated for the JSON-RPC transport yet
+(no `capabilities`/`protocolVersion` bump). That is a gated change (see A2A_JSONRPC.md).
 
 This is a **compatibility layer**, not a full A2A JSON-RPC server yet.

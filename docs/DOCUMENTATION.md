@@ -112,6 +112,7 @@ python -m agents.seed_agents
 | GET | `/a2a/tasks/{thread_id}` | Один Task |
 | GET | `/a2a/agents` | Представления как A2A-ориентированные агенты (`?q=&model=&limit=&offset=`) |
 | GET | `/a2a/agents/{agent_id}` | Один агент-descriptor |
+| POST | `/a2a` | A2A JSON-RPC: `message/send`, `tasks/get` |
 | GET | `/health` | Healthcheck |
 | GET | `/metrics` | Метрики |
 | GET | `/robots.txt` | Политика для краулеров |
