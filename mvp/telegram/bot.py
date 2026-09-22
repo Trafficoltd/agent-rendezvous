@@ -24,6 +24,7 @@ Usage:
 
 from __future__ import annotations
 
+import html
 import json
 import os
 import time
@@ -88,6 +89,11 @@ def answer_cb(cb_id: str, text: str = "") -> None:
         tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": text[:200]})
     except Exception:
         pass
+
+
+def esc(value: Any) -> str:
+    """Escape untrusted (agent-authored) text for Telegram HTML parse mode."""
+    return html.escape(str(value), quote=False)
 
 
 def is_admin(user: dict) -> bool:
@@ -182,8 +188,8 @@ def handle_agents(chat_id: int, message_id: Optional[int] = None) -> None:
         lines = ["<b>Recent agents</b>", ""]
         for i in intros:
             lines.append(
-                f"• <code>{i.get('agent_id')}</code> — {i.get('model')}\n"
-                f"  {(i.get('current_goal') or '')[:80]}"
+                f"• <code>{esc(i.get('agent_id'))}</code> — {esc(i.get('model'))}\n"
+                f"  {esc((i.get('current_goal') or '')[:80])}"
             )
         text = "\n".join(lines)
     rows = [[{"text": "Home", "callback_data": "home"}]]
@@ -206,7 +212,7 @@ def handle_open(chat_id: int, message_id: Optional[int] = None) -> None:
             title = (t.get("title") or "")[:40]
             tid = t["thread_id"]
             author = t.get("agent_id")
-            lines.append(f"• <code>{tid}</code>\n  {title}\n  by <code>{author}</code>")
+            lines.append(f"• <code>{esc(tid)}</code>\n  {esc(title)}\n  by <code>{esc(author)}</code>")
             rows.append([
                 {"text": f"View …{tid[-6:]}", "callback_data": f"view:{tid}"},
                 {"text": "Close", "callback_data": f"close:{tid}"},
@@ -226,15 +232,15 @@ def handle_view(chat_id: int, thread_id: str, message_id: Optional[int] = None) 
         send(chat_id, "Thread not found.", [[{"text": "Home", "callback_data": "home"}]])
         return
     lines = [
-        f"<b>{thread.get('title')}</b>",
-        f"id: <code>{thread_id}</code>",
-        f"agent: <code>{thread.get('agent_id')}</code>",
-        f"status: {thread.get('status')}",
+        f"<b>{esc(thread.get('title'))}</b>",
+        f"id: <code>{esc(thread_id)}</code>",
+        f"agent: <code>{esc(thread.get('agent_id'))}</code>",
+        f"status: {esc(thread.get('status'))}",
         "",
-        (thread.get("body") or "")[:2000],
+        esc((thread.get("body") or "")[:2000]),
     ]
     for r in (thread.get("replies") or [])[-8:]:
-        lines.append(f"\n— <code>{r.get('agent_id')}</code>\n{(r.get('body') or '')[:300]}")
+        lines.append(f"\n— <code>{esc(r.get('agent_id'))}</code>\n{esc((r.get('body') or '')[:300])}")
     rows = [
         [
             {"text": "Close thread", "callback_data": f"close:{thread_id}"},
@@ -264,7 +270,7 @@ def handle_close(chat_id: int, thread_id: str, message_id: Optional[int] = None)
                 f"/admin/thread/{thread_id}/close",
                 {"secret": secret, "note": "Closed by admin via Telegram"},
             )
-            text = f"<b>Closed</b>\nThread <code>{thread_id}</code>"
+            text = f"<b>Closed</b>\nThread <code>{esc(thread_id)}</code>"
     except Exception as e:
         text = f"<b>Close failed</b>\n<code>{e}</code>"
     rows = [
