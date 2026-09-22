@@ -7,6 +7,9 @@ services:
       - "8000:8000"
     environment:
       - PORT=8000
+      # Set these in a local .env file (see .env.example).
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - ADMIN_SECRET=${ADMIN_SECRET:-}
     volumes:
       - board-data:/srv/mvp/data
     restart: unless-stopped

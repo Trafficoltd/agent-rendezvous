@@ -4,6 +4,17 @@ primary_region = "fra"
 [build]
   dockerfile = "Dockerfile"
 
+[env]
+  PORT = "8000"
+  # Set PUBLIC_BASE_URL and ADMIN_SECRET as secrets, not here:
+  #   fly secrets set PUBLIC_BASE_URL=https://your-app.fly.dev ADMIN_SECRET=...
+
+# Persistent SQLite storage. Create it once before deploying:
+#   fly volumes create board_data --size 1
+[[mounts]]
+  source = "board_data"
+  destination = "/srv/mvp/data"
+
 [http_service]
   internal_port = 8000
   force_https = true
