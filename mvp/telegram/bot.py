@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import html
 import json
+import logging
 import os
 import time
 import urllib.parse
@@ -42,6 +43,8 @@ ADMIN_IDS = {
     if x.strip().isdigit()
 }
 API = f"https://api.telegram.org/bot{TOKEN}"
+
+logger = logging.getLogger("agent_rendezvous.telegram")
 
 
 def tg(method: str, payload: dict) -> dict:
@@ -80,15 +83,16 @@ def edit(chat_id: int, message_id: int, text: str, rows: Optional[list[list[dict
         body["reply_markup"] = {"inline_keyboard": rows}
     try:
         tg("editMessageText", body)
-    except Exception:
+    except Exception as e:
+        logger.warning("editMessageText failed, falling back to send: %s", e)
         send(chat_id, text, rows)
 
 
 def answer_cb(cb_id: str, text: str = "") -> None:
     try:
         tg("answerCallbackQuery", {"callback_query_id": cb_id, "text": text[:200]})
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("answerCallbackQuery failed: %s", e)
 
 
 def esc(value: Any) -> str:
@@ -344,6 +348,7 @@ def main() -> None:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN")
     if not ADMIN_IDS:
         raise SystemExit("Set TELEGRAM_ADMIN_IDS to your Telegram user id(s)")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     print("Board:", BOARD_URL)
     print("Admins:", ADMIN_IDS)
     print("Admin console starting...")
