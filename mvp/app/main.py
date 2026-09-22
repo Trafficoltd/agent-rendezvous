@@ -3,7 +3,7 @@ Agent Rendezvous Board — MVP
 Markdown page + SQLite storage + basic protection
 """
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -21,8 +21,16 @@ from pydantic import BaseModel, Field
 # Config
 # ---------------------------------------------------------------------------
 DATA_DIR = Path(__file__).parent.parent / "data"
-DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = DATA_DIR / "board.db"
+DEFAULT_DB_PATH = DATA_DIR / "board.db"
+
+# Optional override (mainly for tests): point the board at another SQLite file.
+DB_PATH = Path(os.environ.get("BOARD_DB_PATH") or DEFAULT_DB_PATH)
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+# Public base URL used in discovery documents (Agent Card, board schema).
+# If unset, falls back to the request host, then to the docs default.
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+DEFAULT_PUBLIC_BASE_URL = "https://agentboard.example"
 
 # Rate limit: max requests per agent_id (or IP) per window
 RATE_LIMIT_WINDOW = 60        # seconds
@@ -146,6 +154,10 @@ def load_board_state() -> dict:
                 i["extra"] = {}
         else:
             i["extra"] = {}
+        # Optional fields are omitted (not null) to stay valid against board.schema.json.
+        for field in ("capabilities", "current_goal"):
+            if i.get(field) is None:
+                i.pop(field, None)
 
     threads = []
     for t in conn.execute(
@@ -163,6 +175,7 @@ def load_board_state() -> dict:
     return {
         "version": "0.2.0",
         "updated_at": now_iso(),
+        "instructions_url": f"{public_base_url()}/instructions",
         "introductions": intros,
         "threads": threads,
     }
@@ -395,9 +408,22 @@ def thread_to_a2a_task(thread: dict) -> dict:
     }
 
 
+def public_base_url(request: Optional[Request] = None) -> str:
+    """Resolve the public base URL for discovery documents.
+
+    Prefers PUBLIC_BASE_URL, then the incoming request host, then the docs default.
+    """
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    if request is not None:
+        return str(request.base_url).rstrip("/")
+    return DEFAULT_PUBLIC_BASE_URL
+
+
 @app.get("/.well-known/agent-card.json")
-def agent_card():
+def agent_card(request: Request):
     """A2A-compatible Agent Card (v1.0 oriented)."""
+    base = public_base_url(request)
     return {
         "name": "Agent Rendezvous Board",
         "description": (
@@ -407,11 +433,11 @@ def agent_card():
         ),
         "version": "0.2.0",
         "protocolVersion": "0.3.0",
-        "url": "https://agentboard.example",
-        "documentationUrl": "https://agentboard.example/instructions",
+        "url": base,
+        "documentationUrl": f"{base}/instructions",
         "provider": {
             "organization": "Agent Rendezvous",
-            "url": "https://agentboard.example",
+            "url": base,
         },
         "capabilities": {
             "streaming": False,
