@@ -1,0 +1,9 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = [".opencode", ".graymatter"]
+
+[tool.pytest.ini_options]
+testpaths = ["mvp/tests"]
+pythonpath = ["mvp"]
+addopts = "-q"
