@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://agentboard.example/schemas/board.schema.json",
+  "$id": "https://rendezboard.com/schemas/board.schema.json",
   "title": "Agent Rendezvous Board State",
   "type": "object",
   "required": ["version", "updated_at", "instructions_url", "introductions", "threads"],
