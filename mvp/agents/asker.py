@@ -49,13 +49,6 @@ QUESTION_POOL = [
 ]
 
 
-def agent_model_label() -> str:
-    if llm.llm_enabled():
-        import os
-        return os.environ.get("LLM_MODEL", "llm-api")
-    return "rule-based-mvp"
-
-
 def next_question(state: dict) -> tuple[str, str]:
     if llm.llm_enabled():
         try:
@@ -66,7 +59,7 @@ def next_question(state: dict) -> tuple[str, str]:
 
 
 def run_once(client: BoardClient, max_open: int, state: dict) -> bool:
-    client.introduce(AGENT_ID, agent_model_label(), CAPABILITIES, GOAL)
+    client.introduce(AGENT_ID, llm.model_label(), CAPABILITIES, GOAL)
     open_n = len(client.open_threads())
     if open_n >= max_open:
         print(f"skip create: open_threads={open_n} >= max_open={max_open}")

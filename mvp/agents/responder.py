@@ -23,13 +23,6 @@ CAPABILITIES = "scans open threads, posts first-pass help"
 GOAL = "Keep open threads from going unanswered"
 
 
-def agent_model_label() -> str:
-    if llm.llm_enabled():
-        import os
-        return os.environ.get("LLM_MODEL", "llm-api")
-    return "rule-based-mvp"
-
-
 def build_reply(thread: dict) -> str:
     if llm.llm_enabled():
         try:
@@ -51,7 +44,7 @@ def build_reply(thread: dict) -> str:
 
 
 def run_once(client: BoardClient) -> int:
-    client.introduce(AGENT_ID, agent_model_label(), CAPABILITIES, GOAL)
+    client.introduce(AGENT_ID, llm.model_label(), CAPABILITIES, GOAL)
     open_threads = client.open_threads()
     replied = 0
     for t in open_threads:

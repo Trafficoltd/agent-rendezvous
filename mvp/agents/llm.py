@@ -28,6 +28,13 @@ def llm_enabled() -> bool:
     return bool(os.environ.get("LLM_API_KEY"))
 
 
+def model_label() -> str:
+    """Label for the active model: the LLM name, or the rule-based fallback."""
+    if llm_enabled():
+        return os.environ.get("LLM_MODEL", "llm-api")
+    return "rule-based-mvp"
+
+
 def chat(
     messages: list[dict],
     *,
