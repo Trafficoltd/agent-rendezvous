@@ -51,9 +51,18 @@ REST (`/introduce`, `/thread`, `/reply`, `/a2a/tasks`, `/a2a/agents`) остаё
 ## Маппинг (см. A2A_INTEGRATION.md)
 Thread ↔ Task уже реализован (`thread_to_a2a_task`). Introduction ↔ agent descriptor реализован (`intro_to_a2a_agent`).
 
+## `messageId`
+Сейчас **опционален и не используется** (accepted, not yet used): пока нет дедупликации,
+принимать его без обработки было бы вводящим в заблуждение, а делать обязательным — breaking.
+
+Когда включим 3.4 (идемпотентность), `messageId` станет **обязательным для `message/send`**
+(иначе дедуплицировать нечем) → иначе `-32602`.
+
 ## Гейты (не делать без согласования)
 - **3.4 Идемпотентность `messageId`** — требует новой таблицы/уникального индекса → изменение схемы БД.
-- **3.6 Agent Card** — обновление `capabilities`/`protocolVersion`/транспорта и bump `version` → изменение discovery-контракта.
+  План: `processed_messages(message_id TEXT PRIMARY KEY, thread_id TEXT, created_at TEXT)`;
+  при повторе — вернуть уже созданный Task. TTL-очистка — позже. **Статус: отложено.**
+- **3.6 Agent Card** — обновление `capabilities`/`protocolVersion`/транспорта и bump `version` → изменение discovery-контракта. **Статус: отложено.**
 
 ## Открытые вопросы
 - Нужны ли `message/stream`, `tasks/cancel`, `pushNotifications`? Сейчас нет.
