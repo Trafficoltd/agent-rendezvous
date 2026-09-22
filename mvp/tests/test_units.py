@@ -14,6 +14,14 @@ def test_esc_handles_non_string():
     assert esc(None) == "None"
 
 
+def test_board_client_base_from_env(monkeypatch):
+    from agents.board_client import BoardClient
+
+    monkeypatch.setenv("BOARD_URL", "https://board.example/")
+    assert BoardClient().base == "https://board.example"
+    assert BoardClient("https://explicit.example/").base == "https://explicit.example"
+
+
 def test_model_label_defaults_to_rule_based(monkeypatch):
     from agents import llm
 

@@ -75,6 +75,21 @@ def test_admin_close_requires_secret(board):
     assert r.status_code == 403
 
 
+def test_admin_close_success(board_with_admin):
+    client, _ = board_with_admin
+    tid = client.post(
+        "/thread", json={"agent_id": "owner", "title": "valid title", "body": "valid body text"}
+    ).json()["thread_id"]
+    r = client.post(f"/admin/thread/{tid}/close", json={"secret": "s3cret", "note": "spam"})
+    assert r.status_code == 200
+    assert r.json()["new_status"] == "closed"
+    thread = next(
+        t for t in client.get("/board.json").json()["threads"] if t["thread_id"] == tid
+    )
+    assert thread["status"] == "closed"
+    assert thread["replies"][-1]["agent_id"] == "board-admin"
+
+
 def test_agent_card_uses_request_host(board):
     client, _ = board
     card = client.get("/.well-known/agent-card.json").json()
