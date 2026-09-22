@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: agent-rendezvous-board
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: PORT
+        value: 8000
+    healthCheckPath: /health
