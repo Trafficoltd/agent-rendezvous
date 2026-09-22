@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import sys
 
-from agents.board_client import BoardClient, DEFAULT_BASE
+from agents.board_client import BoardClient
 
 
 def main(base: str | None = None) -> None:

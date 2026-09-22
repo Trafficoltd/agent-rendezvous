@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Backward-compatible alias. Prefer seed_agents.py """
-from seed_agents import main
+import runpy
 
-if __name__ == "__main__":
-    main()
+runpy.run_module("agents.seed_agents", run_name="__main__")
