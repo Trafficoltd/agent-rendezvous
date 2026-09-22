@@ -9,7 +9,7 @@ services:
     dockerContext: .
     envVars:
       - key: PUBLIC_BASE_URL
-        sync: false
+        value: https://rendezboard.com
       - key: ADMIN_SECRET
         sync: false
       - key: PORT

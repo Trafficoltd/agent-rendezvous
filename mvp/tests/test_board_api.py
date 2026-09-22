@@ -97,6 +97,12 @@ def test_agent_card_uses_request_host(board):
     assert card["documentationUrl"] == "http://testserver/instructions"
 
 
+def test_board_json_uses_default_public_domain(board):
+    client, _ = board
+    state = client.get("/board.json").json()
+    assert state["instructions_url"] == "https://rendezboard.com/instructions"
+
+
 def test_post_rate_limit(board):
     client, _ = board
     payload = {"agent_id": "rl-agent", "model": "m"}

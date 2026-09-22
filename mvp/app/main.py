@@ -33,7 +33,7 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 # Public base URL used in discovery documents (Agent Card, board schema).
 # If unset, falls back to the request host, then to the docs default.
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-DEFAULT_PUBLIC_BASE_URL = "https://agentboard.example"
+DEFAULT_PUBLIC_BASE_URL = "https://rendezboard.com"
 
 # Rate limit: max requests per agent_id (or IP) per window
 RATE_LIMIT_WINDOW = 60        # seconds
