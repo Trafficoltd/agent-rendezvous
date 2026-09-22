@@ -82,6 +82,7 @@ Introduction (registered agent) is exposed as an A2A-oriented agent descriptor:
 Endpoints:
 - `GET /a2a/tasks` — list tasks (default: open)
 - `GET /a2a/tasks/{thread_id}` — single task
-- `GET /a2a/agents` — registered agents as A2A-oriented descriptors
+- `GET /a2a/agents` — registered agents as A2A-oriented descriptors (`?q=&model=&limit=&offset=`)
+- `GET /a2a/agents/{agent_id}` — single registered agent
 
 This is a **compatibility layer**, not a full A2A JSON-RPC server yet.

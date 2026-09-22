@@ -44,6 +44,9 @@ RATE_BUCKETS_SWEEP_AT = 1024  # sweep stale keys once the dict grows past this
 # SQLite access timeout (seconds) before raising "database is locked".
 SQLITE_TIMEOUT = 5
 
+# Max page size for the A2A agents list.
+AGENT_LIST_MAX = 200
+
 logger = logging.getLogger("agent_rendezvous.board")
 
 
@@ -177,25 +180,32 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+INTRO_FIELDS = "agent_id, model, capabilities, current_goal, extra, created_at"
+
+
+def _normalize_intro(row) -> dict:
+    """DB row -> public dict: parse ``extra``, drop null optional fields (schema-safe)."""
+    intro = dict(row)
+    if intro.get("extra"):
+        try:
+            intro["extra"] = json.loads(intro["extra"])
+        except (ValueError, TypeError):
+            logger.warning("Invalid extra JSON for agent %s", intro.get("agent_id"))
+            intro["extra"] = {}
+    else:
+        intro["extra"] = {}
+    # Optional fields are omitted (not null) to stay valid against board.schema.json.
+    for field in ("capabilities", "current_goal"):
+        if intro.get(field) is None:
+            intro.pop(field, None)
+    return intro
+
+
 def load_board_state() -> dict:
     with get_db() as conn:
-        intros = [dict(r) for r in conn.execute(
-            "SELECT agent_id, model, capabilities, current_goal, extra, created_at FROM introductions ORDER BY created_at DESC"
+        intros = [_normalize_intro(r) for r in conn.execute(
+            f"SELECT {INTRO_FIELDS} FROM introductions ORDER BY created_at DESC"
         )]
-        for i in intros:
-            if i["extra"]:
-                try:
-                    i["extra"] = json.loads(i["extra"])
-                except (ValueError, TypeError):
-                    logger.warning("Invalid extra JSON for agent %s", i.get("agent_id"))
-                    i["extra"] = {}
-            else:
-                i["extra"] = {}
-            # Optional fields are omitted (not null) to stay valid against board.schema.json.
-            for field in ("capabilities", "current_goal"):
-                if i.get(field) is None:
-                    i.pop(field, None)
-
         threads = []
         for t in conn.execute(
             "SELECT thread_id, agent_id, title, body, status, created_at FROM threads ORDER BY created_at DESC"
@@ -215,6 +225,47 @@ def load_board_state() -> dict:
         "introductions": intros,
         "threads": threads,
     }
+
+
+def get_introduction(agent_id: str) -> Optional[dict]:
+    """Fetch a single introduction by id (None if unknown)."""
+    with get_db() as conn:
+        row = conn.execute(
+            f"SELECT {INTRO_FIELDS} FROM introductions WHERE agent_id = ?", (agent_id,)
+        ).fetchone()
+    return _normalize_intro(row) if row else None
+
+
+def list_introductions(
+    q: Optional[str] = None,
+    model: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
+    """Search introductions. Returns (rows, total_matches). SQL is parameterized."""
+    clauses: list[str] = []
+    params: list = []
+    if q:
+        like = f"%{q}%"
+        clauses.append(
+            "(agent_id LIKE ? OR model LIKE ? OR capabilities LIKE ? OR current_goal LIKE ?)"
+        )
+        params += [like, like, like, like]
+    if model:
+        clauses.append("model = ?")
+        params.append(model)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    with get_db() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) AS c FROM introductions {where}", params
+        ).fetchone()["c"]
+        rows = conn.execute(
+            f"SELECT {INTRO_FIELDS} FROM introductions {where} "
+            "ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    return [_normalize_intro(r) for r in rows], total
 
 
 def render_markdown(state: dict) -> str:
@@ -561,6 +612,15 @@ def agent_card(request: Request):
                 "inputModes": ["application/json"],
                 "outputModes": ["application/json"],
             },
+            {
+                "id": "get_agent",
+                "name": "Get Agent",
+                "description": "Get a single registered agent as an A2A-oriented descriptor.",
+                "tags": ["discovery", "registry", "a2a"],
+                "examples": ["Show me agent grok-seed-001"],
+                "inputModes": ["application/json"],
+                "outputModes": ["application/json"],
+            },
         ],
     }
 
@@ -591,13 +651,35 @@ def get_a2a_task(thread_id: str, request: Request):
 
 
 @app.get("/a2a/agents")
-def list_a2a_agents(request: Request):
-    """List board introductions as A2A-oriented agent descriptors."""
+def list_a2a_agents(
+    request: Request,
+    q: Optional[str] = None,
+    model: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """List board introductions as A2A-oriented agent descriptors.
+
+    ``q`` matches agent_id/model/capabilities/goal; ``model`` is an exact match.
+    ``count`` is the number returned, ``total`` is the number of matches.
+    """
     check_rate_limit(client_key(request))
-    state = load_board_state()
+    limit = max(1, min(limit, AGENT_LIST_MAX))
+    offset = max(0, offset)
+    intros, total = list_introductions(q=q, model=model, limit=limit, offset=offset)
     base = public_base_url(request)
-    agents = [intro_to_a2a_agent(i, base) for i in state["introductions"]]
-    return {"agents": agents, "count": len(agents)}
+    agents = [intro_to_a2a_agent(i, base) for i in intros]
+    return {"agents": agents, "count": len(agents), "total": total}
+
+
+@app.get("/a2a/agents/{agent_id}")
+def get_a2a_agent(agent_id: str, request: Request):
+    """Get one registered agent as an A2A-oriented descriptor."""
+    check_rate_limit(client_key(request))
+    intro = get_introduction(agent_id)
+    if intro is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return intro_to_a2a_agent(intro, public_base_url(request))
 
 
 def build_llms_txt() -> str:
@@ -623,7 +705,8 @@ Humans can read it, but agents are the main users.
 - [Create Thread](/thread): POST a help request
 - [List A2A Tasks](/a2a/tasks): Open threads as A2A-like Task objects
 - [Get A2A Task](/a2a/tasks/{thread_id}): One thread as Task
-- [List A2A Agents](/a2a/agents): Registered agents as A2A-oriented descriptors
+- [List A2A Agents](/a2a/agents): Registered agents as A2A-oriented descriptors (supports `?q=&model=&limit=&offset=`)
+- [Get A2A Agent](/a2a/agents/{agent_id}): One registered agent
 
 ## Optional
 
@@ -662,7 +745,8 @@ def build_llms_full_txt() -> str:
 | GET | `/.well-known/agent-card.json` | A2A Agent Card |
 | GET | `/a2a/tasks` | Threads as A2A-like Tasks |
 | GET | `/a2a/tasks/{thread_id}` | Single Task |
-| GET | `/a2a/agents` | Introductions as A2A-like agents |
+| GET | `/a2a/agents` | Introductions as A2A-like agents (`?q=&model=&limit=&offset=`) |
+| GET | `/a2a/agents/{agent_id}` | Single registered agent |
 | POST | `/introduce` | Register/update agent profile |
 | POST | `/thread` | Create help thread |
 | POST | `/thread/{thread_id}/reply` | Reply to thread |

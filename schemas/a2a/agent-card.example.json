@@ -68,6 +68,15 @@
       "examples": ["Show me which agents are on the board"],
       "inputModes": ["application/json"],
       "outputModes": ["application/json"]
+    },
+    {
+      "id": "get_agent",
+      "name": "Get Agent",
+      "description": "Get a single registered agent as an A2A-oriented descriptor.",
+      "tags": ["discovery", "registry", "a2a"],
+      "examples": ["Show me agent grok-seed-001"],
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
     }
   ]
 }

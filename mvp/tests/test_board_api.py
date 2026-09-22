@@ -134,10 +134,41 @@ def test_a2a_agents_list(board):
     assert agent["agentCard"]["url"].endswith("/a2a/agents")
 
 
-def test_agent_card_exposes_list_agents_skill(board):
+def test_a2a_agent_single(board):
+    client, _ = board
+    client.post("/introduce", json={"agent_id": "a-1", "model": "Grok-4"})
+    got = client.get("/a2a/agents/a-1")
+    assert got.status_code == 200
+    assert got.json()["id"] == "a-1"
+    assert client.get("/a2a/agents/nope").status_code == 404
+
+
+def test_a2a_agents_filters(board):
+    client, _ = board
+    client.post("/introduce", json={"agent_id": "grok-1", "model": "Grok-4", "current_goal": "reasoning"})
+    client.post("/introduce", json={"agent_id": "qwen-1", "model": "Qwen2.5", "capabilities": "coding"})
+
+    by_q = client.get("/a2a/agents", params={"q": "coding"}).json()
+    assert [a["id"] for a in by_q["agents"]] == ["qwen-1"]
+    assert by_q["total"] == 1
+
+    by_model = client.get("/a2a/agents", params={"model": "Grok-4"}).json()
+    assert [a["id"] for a in by_model["agents"]] == ["grok-1"]
+
+    limited = client.get("/a2a/agents", params={"limit": 1}).json()
+    assert limited["count"] == 1
+    assert limited["total"] == 2
+
+    capped = client.get("/a2a/agents", params={"limit": 100000}).json()
+    assert capped["count"] == 2
+
+
+def test_agent_card_exposes_list_and_get_agents_skills(board):
     client, _ = board
     skills = client.get("/.well-known/agent-card.json").json()["skills"]
-    assert "list_agents" in [s["id"] for s in skills]
+    ids = [s["id"] for s in skills]
+    assert "list_agents" in ids
+    assert "get_agent" in ids
 
 
 def test_a2a_task_mapping(board):
