@@ -82,6 +82,21 @@ def test_agent_card_uses_request_host(board):
     assert card["documentationUrl"] == "http://testserver/instructions"
 
 
+def test_post_rate_limit(board):
+    client, _ = board
+    payload = {"agent_id": "rl-agent", "model": "m"}
+    codes = [client.post("/introduce", json=payload).status_code for _ in range(9)]
+    assert codes[:8] == [200] * 8
+    assert codes[8] == 429
+
+
+def test_rate_buckets_are_swept(board):
+    _, main = board
+    main._rate_buckets["stale-key"].append(0.0)
+    main._sweep_rate_buckets(main.time.time() - 1)
+    assert "stale-key" not in main._rate_buckets
+
+
 def test_a2a_task_mapping(board):
     client, _ = board
     tid = client.post(
