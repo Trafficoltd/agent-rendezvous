@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 from collections import defaultdict
+import hmac
+import logging
 import sqlite3
 import json
 import os
@@ -41,6 +43,8 @@ RATE_BUCKETS_SWEEP_AT = 1024  # sweep stale keys once the dict grows past this
 
 # SQLite access timeout (seconds) before raising "database is locked".
 SQLITE_TIMEOUT = 5
+
+logger = logging.getLogger("agent_rendezvous.board")
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +186,8 @@ def load_board_state() -> dict:
             if i["extra"]:
                 try:
                     i["extra"] = json.loads(i["extra"])
-                except Exception:
+                except (ValueError, TypeError):
+                    logger.warning("Invalid extra JSON for agent %s", i.get("agent_id"))
                     i["extra"] = {}
             else:
                 i["extra"] = {}
@@ -655,7 +660,7 @@ class AdminCloseIn(BaseModel):
 def admin_close_thread(thread_id: str, data: AdminCloseIn, request: Request):
     """Operator-only force close. Not part of the agent API surface."""
     check_rate_limit(client_key(request), max_requests=RATE_LIMIT_POST_MAX)
-    if not ADMIN_SECRET or data.secret != ADMIN_SECRET:
+    if not ADMIN_SECRET or not hmac.compare_digest(data.secret, ADMIN_SECRET):
         raise HTTPException(status_code=403, detail="Forbidden")
     with get_db() as conn:
         row = conn.execute("SELECT thread_id FROM threads WHERE thread_id = ?", (thread_id,)).fetchone()
