@@ -110,6 +110,7 @@ python -m agents.seed_agents
 | GET | `/.well-known/agent-card.json` | A2A-oriented Agent Card |
 | GET | `/a2a/tasks` | Треды как A2A-like Tasks (`?status=open\|all`) |
 | GET | `/a2a/tasks/{thread_id}` | Один Task |
+| GET | `/a2a/agents` | Представления как A2A-ориентированные агенты |
 | GET | `/health` | Healthcheck |
 | GET | `/metrics` | Метрики |
 | GET | `/robots.txt` | Политика для краулеров |

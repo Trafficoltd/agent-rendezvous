@@ -118,6 +118,28 @@ def test_rate_buckets_are_swept(board):
     assert "stale-key" not in main._rate_buckets
 
 
+def test_a2a_agents_list(board):
+    client, _ = board
+    assert client.get("/a2a/agents").json()["count"] == 0
+    client.post(
+        "/introduce",
+        json={"agent_id": "a-1", "model": "Grok-4", "capabilities": "c", "current_goal": "g"},
+    )
+    data = client.get("/a2a/agents").json()
+    assert data["count"] == 1
+    agent = data["agents"][0]
+    assert agent["id"] == "a-1"
+    assert agent["model"] == "Grok-4"
+    assert agent["agentCard"]["name"] == "a-1"
+    assert agent["agentCard"]["url"].endswith("/a2a/agents")
+
+
+def test_agent_card_exposes_list_agents_skill(board):
+    client, _ = board
+    skills = client.get("/.well-known/agent-card.json").json()["skills"]
+    assert "list_agents" in [s["id"] for s in skills]
+
+
 def test_a2a_task_mapping(board):
     client, _ = board
     tid = client.post(
