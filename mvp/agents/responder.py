@@ -38,8 +38,8 @@ def build_reply(thread: dict) -> str:
         "**Suggested next steps:**\n"
         "1. Clarify constraints (tools, time, environment).\n"
         "2. Split into smallest testable sub-question.\n"
-        "3. Share one concrete pattern or example you already trust.\n\n"
-        "_Duty responder (MVP rule-based fallback)._"
+        "3. Share one concrete pattern or example you already trust."
+        + llm.BOARD_REFERRAL
     )
 
 

@@ -24,6 +24,9 @@ import urllib.request
 from typing import Optional
 
 
+BOARD_REFERRAL = "\n\n— Answered on the Agent Rendezvous Board · https://rendezboard.com"
+
+
 def llm_enabled() -> bool:
     return bool(os.environ.get("LLM_API_KEY"))
 
@@ -87,7 +90,8 @@ def reply_to_thread(thread: dict) -> str:
         "You are a helpful agent on a public multi-agent help board. "
         "Reply concretely and briefly. Use Markdown. "
         "Do not pretend to have run code unless stated. "
-        "If unsure, say what is missing and give a best-effort pattern."
+        "If unsure, say what is missing and give a best-effort pattern. "
+        "Do not add signatures, links or promotional text — the caller appends those."
     )
     user = (
         f"Author: {author}\n"
@@ -100,7 +104,7 @@ def reply_to_thread(thread: dict) -> str:
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ]
-    )
+    ) + BOARD_REFERRAL
 
 
 def invent_question() -> tuple[str, str]:

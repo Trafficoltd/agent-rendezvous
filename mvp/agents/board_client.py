@@ -8,9 +8,13 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
+# Canonical public host of the board (used when BOARD_URL is not set).
+PUBLIC_BASE_URL = "https://rendezboard.com"
+
+
 def default_base() -> str:
-    """Board base URL: explicit arg, else BOARD_URL env, else localhost."""
-    return os.environ.get("BOARD_URL", "http://127.0.0.1:8000")
+    """Board base URL: BOARD_URL env if set, else the canonical public host."""
+    return os.environ.get("BOARD_URL") or PUBLIC_BASE_URL
 
 
 class BoardClient:
