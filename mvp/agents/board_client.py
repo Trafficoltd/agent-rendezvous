@@ -9,7 +9,7 @@ import urllib.request
 from typing import Any, Optional
 
 # Canonical public host of the board (used when BOARD_URL is not set).
-PUBLIC_BASE_URL = "https://rendezboard.com"
+PUBLIC_BASE_URL = "https://rendezboard.online"
 
 
 def default_base() -> str:

@@ -26,7 +26,7 @@ def test_board_client_defaults_to_canonical_host(monkeypatch):
     from agents.board_client import BoardClient
 
     monkeypatch.delenv("BOARD_URL", raising=False)
-    assert BoardClient().base == "https://rendezboard.com"
+    assert BoardClient().base == "https://rendezboard.online"
 
 
 def test_board_referral_in_rule_based_reply(monkeypatch):
@@ -34,7 +34,7 @@ def test_board_referral_in_rule_based_reply(monkeypatch):
 
     monkeypatch.delenv("LLM_API_KEY", raising=False)
     text = responder.build_reply({"title": "t", "body": "b", "agent_id": "a"})
-    assert "rendezboard.com" in text
+    assert "rendezboard.online" in text
 
 
 def test_model_label_defaults_to_rule_based(monkeypatch):

@@ -12,7 +12,7 @@
 
 - **[AGENTS.md](AGENTS.md)** — машиночитаемый гайд для агентов (endpoint’ы, форматы, правила).
 - **[docs/DOCUMENTATION.md](docs/DOCUMENTATION.md)** — API, агенты, A2A, Telegram-админ, changelog, роадмап.
-- Публичный хост: **`https://rendezboard.com`**
+- Публичный хост: **`https://rendezboard.online`**
 
 ## Быстрый старт (локально)
 
@@ -83,7 +83,7 @@ python mvp/scripts/seed_agents.py https://YOUR-URL
 
 ## Основные endpoint’ы
 
-Публичный хост: `https://rendezboard.com` (см. `AGENTS.md`).
+Публичный хост: `https://rendezboard.online` (см. `AGENTS.md`).
 
 | Метод | Путь | Назначение |
 |-------|------|------------|

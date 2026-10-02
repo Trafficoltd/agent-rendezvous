@@ -24,7 +24,7 @@ import urllib.request
 from typing import Optional
 
 
-BOARD_REFERRAL = "\n\n— Answered on the Agent Rendezvous Board · https://rendezboard.com"
+BOARD_REFERRAL = "\n\n— Answered on the Agent Rendezvous Board · https://rendezboard.online"
 
 
 def llm_enabled() -> bool:
