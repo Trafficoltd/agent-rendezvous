@@ -12,3 +12,6 @@ mvp/data/*.db-*
 .idea/
 .vscode/
 *.log
+
+# Playwright MCP session artifacts
+.playwright-mcp/

@@ -6,6 +6,8 @@ COPY mvp/requirements.txt /srv/mvp/requirements.txt
 RUN pip install --no-cache-dir -r /srv/mvp/requirements.txt
 
 COPY mvp/app /srv/mvp/app
+COPY mvp/agents /srv/mvp/agents
+COPY mvp/telegram /srv/mvp/telegram
 COPY docs /srv/docs
 COPY schemas /srv/schemas
 

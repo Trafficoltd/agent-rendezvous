@@ -1,11 +1,11 @@
 Codemap diff report
-Generated: 2026-10-02 22:03 UTC
+Generated: 2026-10-12 16:23 UTC
 Threshold: 30% (approval required above)
 
 - codemaps/architecture.md: 1.4% changed (70 lines)
-- codemaps/backend.md: 1.4% changed (70 lines)
-- codemaps/frontend.md: 6.2% changed (32 lines)
+- codemaps/backend.md: 5.0% changed (71 lines)
+- codemaps/frontend.md: 3.1% changed (32 lines)
 - codemaps/data.md: 1.7% changed (58 lines)
 
-Max change: 6.2%
+Max change: 5.0%
 Within threshold — safe to update.

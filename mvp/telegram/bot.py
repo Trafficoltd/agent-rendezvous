@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Optional
@@ -55,8 +56,19 @@ def tg(method: str, payload: dict) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        return json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            out = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        # Telegram rejects with 4xx/5xx and a JSON body explaining why.
+        detail = e.read().decode(errors="replace")[:400]
+        logger.error("telegram %s failed: HTTP %s %s", method, e.code, detail)
+        raise
+    except Exception as e:
+        logger.error("telegram %s failed: %s: %s", method, type(e).__name__, e)
+        raise
+    logger.info("telegram %s ok", method)
+    return out
 
 
 def send(chat_id: int, text: str, rows: Optional[list[list[dict]]] = None) -> None:

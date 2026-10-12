@@ -93,7 +93,8 @@ def test_admin_close_success(board_with_admin):
 def test_agent_card_uses_request_host(board):
     client, _ = board
     card = client.get("/.well-known/agent-card.json").json()
-    assert card["url"] == "http://testserver"
+    # `url` is the A2A service endpoint, not the site root (agent-discovery).
+    assert card["url"] == "http://testserver/a2a"
     assert card["documentationUrl"] == "http://testserver/instructions"
 
 
@@ -179,3 +180,99 @@ def test_a2a_task_mapping(board):
     task = client.get(f"/a2a/tasks/{tid}").json()
     assert task["status"]["state"] == "working"
     assert client.get("/a2a/tasks").json()["count"] == 1
+
+
+def test_head_is_supported_like_get(board):
+    """Crawlers, uptime monitors and registries probe liveness with HEAD.
+
+    Every HEAD used to return 405, which is why a registry recorded
+    ``task_conformance: {"category": "405", "passed": false}`` for this board.
+    """
+    client, _ = board
+    for path in ["/", "/health", "/board.json", "/.well-known/agent-card.json", "/llms.txt"]:
+        r = client.head(path)
+        assert r.status_code == 200, (path, r.status_code)
+        assert r.content == b"", path
+        assert int(r.headers["content-length"]) > 0, path
+
+
+def test_board_json_pagination(board):
+    client, _ = board
+    for i in range(5):
+        created = client.post(
+            "/thread",
+            json={"agent_id": f"a-{i}", "title": f"Title {i}", "body": f"body text number {i}"},
+        )
+        assert created.status_code == 200, created.text
+
+    page = client.get("/board.json", params={"limit": 2}).json()
+    assert page["count"] == 2
+    assert page["total"] == 5
+    assert page["next_offset"] == 2
+    assert len(page["threads"]) == 2
+
+    last = client.get("/board.json", params={"limit": 2, "offset": 4}).json()
+    assert last["count"] == 1
+    assert last["next_offset"] is None
+
+    default = client.get("/board.json").json()
+    assert default["total"] == 5
+    assert default["count"] == len(default["threads"])
+
+
+def test_board_json_since_cursor(board):
+    client, _ = board
+    created = client.post(
+        "/thread", json={"agent_id": "a-1", "title": "old", "body": "body text long enough"}
+    )
+    assert created.status_code == 200, created.text
+    newest = client.get("/board.json").json()["threads"][0]["created_at"]
+
+    after = client.get("/board.json", params={"since": newest}).json()
+    assert after["total"] == 0
+
+    bad = client.get("/board.json", params={"since": "not-a-timestamp"})
+    assert bad.status_code == 400
+
+
+def test_a2a_tasks_pagination(board):
+    client, _ = board
+    for i in range(3):
+        created = client.post(
+            "/thread",
+            json={"agent_id": f"a-{i}", "title": f"Title {i}", "body": f"body text number {i}"},
+        )
+        assert created.status_code == 200, created.text
+
+    everything = client.get("/a2a/tasks", params={"status": "all"}).json()
+    assert everything["total"] == 3
+
+    page = client.get("/a2a/tasks", params={"limit": 1, "status": "all"}).json()
+    assert page["count"] == 1
+    assert page["total"] == 3
+    assert page["next_offset"] == 1
+
+
+def test_round_md_is_ready_to_run(board):
+    """The round prompt must carry a live snapshot and the untrusted-data rule."""
+    client, _ = board
+    created = client.post(
+        "/thread",
+        json={"agent_id": "asker-1", "title": "Need a memory pattern", "body": "body text long enough"},
+    ).json()
+
+    r = client.get("/round.md")
+    assert r.status_code == 200
+    text = r.text
+    assert "Round prompt" in text
+    assert "/board.json" in text
+    assert "1 open threads" in text
+    assert "1 of them unanswered" in text
+    # the shortlist points at the real thread
+    assert created["thread_id"] in text
+    # and the injection rule is stated
+    assert "untrusted data" in text
+    # no template placeholder may reach the client un-interpolated
+    assert "{base}" not in text
+    # liveness is cheap
+    assert client.head("/round.md").status_code == 200
