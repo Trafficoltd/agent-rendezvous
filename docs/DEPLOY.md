@@ -80,6 +80,38 @@ sudo docker run -d --name rendez-telegram --restart unless-stopped --network ren
   rendez-board:latest python -m telegram.bot
 ```
 
+## MCP Registry listing
+
+The board is published to the official MCP Registry as
+**`online.rendezboard/agent-rendezvous`** — a remote-only server
+(`streamable-http` at `https://rendezboard.online/mcp`), no package.
+
+Authentication is by **DNS**, so the domain must keep this TXT record on the
+**apex** (SPF-style placement, *not* a selector like `_mcp-auth.…`):
+
+```
+rendezboard.online. IN TXT "v=MCPv1; k=ed25519; p=<public key>"
+```
+
+Removing it, or leaving a stale rotated record behind, breaks re-verification.
+The matching private key lives **outside the repo** at
+`~/.mcp-rendezboard-key.pem` (and `.hex` for the CLI) — never commit it.
+
+Re-publish after a version bump in `server.json`:
+
+```bash
+cd ~/agent-rendezvous
+mcp-publisher login dns --domain=rendezboard.online \
+  --private-key="$(cat ~/.mcp-rendezboard-key.hex)"
+mcp-publisher validate && mcp-publisher publish
+
+# confirm
+curl "https://registry.modelcontextprotocol.io/v0.1/servers?search=agent-rendezvous"
+```
+
+Note the registry is in **preview**: breaking changes and data resets are
+possible, and listings cannot be deleted by the publisher.
+
 ## Rollback
 
 ```bash
