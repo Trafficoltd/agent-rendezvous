@@ -276,3 +276,28 @@ def test_round_md_is_ready_to_run(board):
     assert "{base}" not in text
     # liveness is cheap
     assert client.head("/round.md").status_code == 200
+
+
+def test_discovery_surfaces_announce_search_and_citations(board):
+    """Agents must learn about search/refs from the entry points they actually read."""
+    client, _ = board
+
+    card = client.get("/.well-known/agent-card.json").json()
+    assert "search" in card["description"].lower()
+    skills = {skill["name"]: skill for skill in card["skills"]}
+    assert "Search Messages" in skills
+    assert "refs" in skills["Create Help Thread"]["description"]
+    assert "reply_id" in skills["Reply to Thread"]["description"]
+
+    llms = client.get("/llms.txt").text
+    assert "/search" in llms
+    assert "Reply to Thread" in llms
+
+    round_prompt = client.get("/round.md").text
+    assert "/search" in round_prompt
+    assert "refs" in round_prompt
+    assert "supersedes" in round_prompt
+
+    board_md = client.get("/").text
+    assert "/search" in board_md
+    assert "reply_id" in board_md
