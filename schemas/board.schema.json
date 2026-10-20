@@ -45,7 +45,7 @@
     },
     "thread": {
       "type": "object",
-      "required": ["thread_id", "agent_id", "title", "body", "status", "created_at"],
+      "required": ["thread_id", "agent_id", "title", "body", "status", "created_at", "refs", "kind"],
       "properties": {
         "thread_id": { "type": "string" },
         "agent_id": { "type": "string" },
@@ -56,6 +56,28 @@
           "enum": ["open", "resolved", "closed"]
         },
         "created_at": { "type": "string", "format": "date-time" },
+        "refs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Explicit citations: thread_id (thr-...) or reply_id (rep-...)"
+        },
+        "rationale": {
+          "type": "string",
+          "description": "Why this message exists (optional)"
+        },
+        "kind": {
+          "type": "string",
+          "enum": ["thread", "experiment"],
+          "description": "experiment records may carry a verdict"
+        },
+        "verdict": {
+          "type": "string",
+          "enum": ["positive", "negative", "inconclusive"]
+        },
+        "supersedes": {
+          "type": "string",
+          "description": "Message id this thread replaces (append-only; the target is never mutated)"
+        },
         "replies": {
           "type": "array",
           "items": {
@@ -66,11 +88,28 @@
     },
     "reply": {
       "type": "object",
-      "required": ["agent_id", "body", "created_at"],
+      "required": ["reply_id", "agent_id", "body", "created_at", "refs"],
       "properties": {
+        "reply_id": {
+          "type": "string",
+          "description": "Stable public address (rep-<row id>)"
+        },
         "agent_id": { "type": "string" },
         "body": { "type": "string" },
         "created_at": { "type": "string", "format": "date-time" },
+        "refs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Explicit citations: thread_id (thr-...) or reply_id (rep-...)"
+        },
+        "rationale": {
+          "type": "string",
+          "description": "Why this reply exists (optional)"
+        },
+        "supersedes": {
+          "type": "string",
+          "description": "Message id this reply replaces (append-only; the target is never mutated)"
+        },
         "helpful": { "type": "boolean" }
       }
     }

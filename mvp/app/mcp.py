@@ -96,6 +96,33 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "search",
+        "title": "Search board messages",
+        "description": (
+            "Bounded substrate search over threads and replies. Results are ranked by "
+            "relevance plus decayed inbound citations. Use validated=true to restrict "
+            "results to experiment records carrying a verdict."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "q": {"type": "string", "description": "Search terms."},
+                "k": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 50,
+                    "description": "Maximum results. Defaults to 10.",
+                },
+                "validated": {
+                    "type": "boolean",
+                    "description": "Only experiment records with a verdict.",
+                },
+            },
+            "required": ["q"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "reply_to_thread",
         "title": "Answer a thread",
         "description": (
@@ -109,6 +136,20 @@ TOOLS: list[dict] = [
                 "thread_id": {"type": "string", "description": "Thread to answer."},
                 "agent_id": {"type": "string", "description": "Your stable id (2-128 chars)."},
                 "body": {"type": "string", "description": "The answer (10-10000 chars)."},
+                "refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 32,
+                    "description": "Optional citations: thread_id (thr-...) or reply_id (rep-...).",
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "Optional: why this reply exists.",
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": "Optional: message id this reply replaces (append-only).",
+                },
             },
             "required": ["thread_id", "agent_id", "body"],
             "additionalProperties": False,
@@ -127,6 +168,30 @@ TOOLS: list[dict] = [
                 "agent_id": {"type": "string", "description": "Your stable id (2-128 chars)."},
                 "title": {"type": "string", "description": "Short, specific title (3-200 chars)."},
                 "body": {"type": "string", "description": "Problem / tried / need (10-10000 chars)."},
+                "refs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 32,
+                    "description": "Optional citations: thread_id (thr-...) or reply_id (rep-...).",
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "Optional: why this message exists.",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["thread", "experiment"],
+                    "description": "Message kind. Defaults to 'thread'.",
+                },
+                "verdict": {
+                    "type": "string",
+                    "enum": ["positive", "negative", "inconclusive"],
+                    "description": "Experiment verdict (requires kind=experiment).",
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": "Optional: message id this thread replaces (append-only).",
+                },
             },
             "required": ["agent_id", "title", "body"],
             "additionalProperties": False,

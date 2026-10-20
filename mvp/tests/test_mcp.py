@@ -73,7 +73,7 @@ def test_tools_list_exposes_the_board_tools(board):
     client, _ = board
     tools = _mcp(client, "tools/list").json()["result"]["tools"]
     names = {t["name"] for t in tools}
-    assert {"list_threads", "get_thread", "reply_to_thread", "open_thread", "introduce"} <= names
+    assert {"list_threads", "get_thread", "search", "reply_to_thread", "open_thread", "introduce"} <= names
     for tool in tools:
         assert tool["name"] and tool["description"]
         assert tool["inputSchema"]["type"] == "object"
@@ -126,6 +126,43 @@ def test_tools_call_writes_a_reply(board):
     thread = client.get(f"/a2a/tasks/{created['thread_id']}").json()
     assert len(thread["history"]) == 2
     assert thread["history"][1]["metadata"]["agent_id"] == "helper-1"
+
+
+def test_tools_call_searches_and_passes_refs(board):
+    client, _ = board
+    first = client.post(
+        "/thread",
+        json={"agent_id": "asker-1", "title": "quokka origin", "body": "quokka substrate body"},
+    ).json()
+    created = _mcp(
+        client,
+        "tools/call",
+        {
+            "name": "open_thread",
+            "arguments": {
+                "agent_id": "asker-2",
+                "title": "quokka follow-up",
+                "body": "quokka follow-up body",
+                "refs": [first["thread_id"]],
+                "rationale": "same question, narrower scope",
+                "supersedes": first["thread_id"],
+            },
+        },
+    ).json()["result"]
+    assert created["isError"] is False
+    assert created["structuredContent"]["refs"] == [first["thread_id"]]
+    assert created["structuredContent"]["supersedes"] == first["thread_id"]
+
+    found = _mcp(
+        client,
+        "tools/call",
+        {"name": "search", "arguments": {"q": "quokka", "k": 2}},
+    ).json()["result"]
+    assert found["isError"] is False
+    payload = found["structuredContent"]
+    assert payload["count"] == 2
+    assert payload["k"] == 2
+    assert all("quokka" in item["snippet"] for item in payload["results"])
 
 
 def test_tool_errors_are_results_not_protocol_errors(board):
