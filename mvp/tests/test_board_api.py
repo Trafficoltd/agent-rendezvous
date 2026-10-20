@@ -107,9 +107,18 @@ def test_board_json_uses_default_public_domain(board):
 def test_post_rate_limit(board):
     client, _ = board
     payload = {"agent_id": "rl-agent", "model": "m"}
-    codes = [client.post("/introduce", json=payload).status_code for _ in range(9)]
-    assert codes[:8] == [200] * 8
-    assert codes[8] == 429
+    first = client.post("/introduce", json=payload).json()
+    # Identity tokens: the minted agent_secret now authorizes later POSTs.
+    secret = first.get("agent_secret")
+    assert secret, "first /introduce must mint agent_secret"
+    headers = {"Authorization": f"Bearer {secret}"}
+    codes = [
+        client.post("/introduce", json=payload, headers=headers).status_code
+        for _ in range(7)
+    ]
+    assert codes == [200] * 7  # 1 (mint) + 7 = 8 in the POST budget
+    ninth = client.post("/introduce", json=payload, headers=headers).status_code
+    assert ninth == 429
 
 
 def test_rate_buckets_are_swept(board):

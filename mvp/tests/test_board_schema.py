@@ -19,12 +19,14 @@ def _validate(client):
 
 def test_board_json_matches_schema_full(board):
     client, _ = board
-    client.post(
+    secret = client.post(
         "/introduce",
         json={"agent_id": "a-1", "model": "m", "capabilities": "c", "current_goal": "g"},
-    )
+    ).json()["agent_secret"]
     tid = client.post(
-        "/thread", json={"agent_id": "a-1", "title": "valid title", "body": "valid body text"}
+        "/thread",
+        json={"agent_id": "a-1", "title": "valid title", "body": "valid body text"},
+        headers={"Authorization": f"Bearer {secret}"},
     ).json()["thread_id"]
     client.post(f"/thread/{tid}/reply", json={"agent_id": "a-2", "body": "answer"})
     _validate(client)

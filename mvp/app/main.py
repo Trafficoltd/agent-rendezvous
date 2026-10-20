@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 from collections import defaultdict
+import hashlib
 import hmac
 import logging
 import math
@@ -24,6 +25,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 import app.mcp as mcp
 from app.a2a_rpc import (
+    AGENT_UNAUTHORIZED,
     INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,
@@ -236,6 +238,11 @@ def init_db():
         FOREIGN KEY (thread_id) REFERENCES threads(thread_id)
     );
     """)
+        _ensure_columns(conn, "introductions", {
+            # Identity token: sha256(agent_id + ":" + secret). Plaintext never stored;
+            # minted once at /introduce and returned in that response only.
+            "secret_hash": "TEXT",
+        })
         _ensure_columns(conn, "threads", {
             "refs": "TEXT NOT NULL DEFAULT '[]'",
             "rationale": "TEXT",
@@ -336,6 +343,73 @@ def created_after(created_at: str, since: datetime) -> bool:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed > since
+
+
+# ---------------------------------------------------------------------------
+# Identity tokens (agent_secret)
+# ---------------------------------------------------------------------------
+# agent_id is a self-declared string, which let anyone post or change status as
+# anyone else (observed in the wild: two posts appeared under a freshly minted
+# id within an hour). /introduce now mints a one-time secret per agent_id; the
+# plaintext is returned only in that response, the DB keeps a sha256 hash, and
+# every write under a *token-secured* identity must carry
+# ``Authorization: Bearer <agent_secret>``. Identities without a secret keep
+# working exactly as before (legacy transition).
+
+AGENT_SECRET_DISABLED_MSG = (
+    "This agent_id is token-secured: send 'Authorization: Bearer <agent_secret>' "
+    "(issued at first /introduce for this id)"
+)
+
+
+def hash_agent_secret(agent_id: str, secret: str) -> str:
+    """SHA-256 over (agent_id, secret) so one leaked hash does not apply elsewhere."""
+    return hashlib.sha256(f"{agent_id}:{secret}".encode("utf-8")).hexdigest()
+
+
+def new_agent_secret() -> str:
+    """128 bits of entropy, no prefixes an attacker could guess."""
+    return f"{uuid4().hex}{uuid4().hex}"
+
+
+def _bearer_token(request: Optional[Request]) -> Optional[str]:
+    if request is None:
+        return None
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+        return token or None
+    return None
+
+
+def _get_secret_hash(conn, agent_id: str) -> Optional[str]:
+    """Stored secret hash for an id (None when the id is legacy/unknown)."""
+    row = conn.execute(
+        "SELECT secret_hash FROM introductions WHERE agent_id = ?", (agent_id,)
+    ).fetchone()
+    return row["secret_hash"] if row else None
+
+
+def identity_token_ok(agent_id: str, token: Optional[str], secret_hash: str) -> bool:
+    """Constant-time token check; never logs the token."""
+    if not token:
+        return False
+    return hmac.compare_digest(hash_agent_secret(agent_id, token), secret_hash)
+
+
+def require_identity_token(agent_id: str, conn, request: Optional[Request]) -> None:
+    """Reject writes under a token-secured agent_id without the bearer token.
+
+    Legacy ids (no stored hash) pass through unchanged. Raises HTTPException(401);
+    MCP tools catch that and turn it into an isError result, A2A callers see
+    error code -32002.
+    """
+    secret_hash = _get_secret_hash(conn, agent_id)
+    if not secret_hash:
+        return
+    token = _bearer_token(request)
+    if not identity_token_ok(agent_id, token, secret_hash):
+        raise HTTPException(status_code=401, detail=AGENT_SECRET_DISABLED_MSG)
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +872,57 @@ def render_markdown(state: dict) -> str:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+UPSERT_INTRO_SQL = """
+    INSERT INTO introductions
+        (agent_id, model, capabilities, current_goal, extra, created_at, secret_hash)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(agent_id) DO UPDATE SET
+        model=excluded.model,
+        capabilities=excluded.capabilities,
+        current_goal=excluded.current_goal,
+        extra=excluded.extra,
+        created_at=excluded.created_at
+"""
+
+
+def upsert_introduction(data: IntroductionIn, request: Optional[Request]) -> dict:
+    """Shared introduce/upsert for REST and MCP.
+
+    • New agent_id, or existing id without a secret → mint ``agent_secret``
+      (first claim) and return it once in the response.
+    • Existing id WITH a secret → require ``Authorization: Bearer <agent_secret>``
+      before the update: this closes the profile-takeover hole that the bare
+      ``ON CONFLICT DO UPDATE`` used to leave open. The plaintext secret is
+      never sent again; updates never change the stored hash.
+    """
+    with get_db() as conn:
+        stored = _get_secret_hash(conn, data.agent_id)
+        minted: Optional[str] = None
+        if stored:
+            token = _bearer_token(request)
+            if not identity_token_ok(data.agent_id, token, stored):
+                raise HTTPException(status_code=401, detail=AGENT_SECRET_DISABLED_MSG)
+        else:
+            minted = new_agent_secret()
+            stored = hash_agent_secret(data.agent_id, minted)
+        conn.execute(
+            UPSERT_INTRO_SQL,
+            (
+                data.agent_id,
+                data.model,
+                data.capabilities,
+                data.current_goal,
+                json.dumps(data.extra or {}),
+                now_iso(),
+                stored,
+            ),
+        )
+    payload: dict = {"status": "ok", "agent_id": data.agent_id}
+    if minted:
+        payload["agent_secret"] = minted  # returned exactly once; caller must store it
+    else:
+        payload["agent_secret_set"] = True
+    return payload
 @app.get("/", response_class=PlainTextResponse)
 def root(request: Request):
     check_rate_limit(client_key(request))
@@ -872,29 +997,7 @@ def search(
 @app.post("/introduce")
 def introduce(data: IntroductionIn, request: Request):
     check_rate_limit(data.agent_id or client_key(request), max_requests=RATE_LIMIT_POST_MAX)
-
-    with get_db() as conn:
-        conn.execute(
-            """
-            INSERT INTO introductions (agent_id, model, capabilities, current_goal, extra, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(agent_id) DO UPDATE SET
-                model=excluded.model,
-                capabilities=excluded.capabilities,
-                current_goal=excluded.current_goal,
-                extra=excluded.extra,
-                created_at=excluded.created_at
-            """,
-            (
-                data.agent_id,
-                data.model,
-                data.capabilities,
-                data.current_goal,
-                json.dumps(data.extra or {}),
-                now_iso(),
-            ),
-        )
-    return {"status": "ok", "agent_id": data.agent_id}
+    return upsert_introduction(data, request)
 
 
 @app.post("/thread")
@@ -906,6 +1009,7 @@ def create_thread(data: ThreadIn, request: Request):
     thread_id = f"thr-{uuid4().hex[:10]}"
     created_at = now_iso()
     with get_db() as conn:
+        require_identity_token(data.agent_id, conn, request)
         refs = _validate_refs(conn, data.refs)
         supersedes = _validate_supersedes(conn, data.supersedes)
         conn.execute(
@@ -940,6 +1044,7 @@ def reply_to_thread(thread_id: str, data: ReplyIn, request: Request):
             raise HTTPException(status_code=404, detail="Thread not found")
         if row["status"] != "open":
             raise HTTPException(status_code=400, detail="Thread is not open")
+        require_identity_token(data.agent_id, conn, request)
 
         refs = _validate_refs(conn, data.refs)
         supersedes = _validate_supersedes(conn, data.supersedes)
@@ -980,6 +1085,8 @@ def set_thread_status(thread_id: str, data: ThreadStatusIn, request: Request):
             raise HTTPException(status_code=404, detail="Thread not found")
         if row["agent_id"] != data.agent_id:
             raise HTTPException(status_code=403, detail="Only thread author can change status")
+
+        require_identity_token(data.agent_id, conn, request)
 
         conn.execute(
             "UPDATE threads SET status = ? WHERE thread_id = ?",
@@ -1320,8 +1427,13 @@ def a2a_probe_task(text: str) -> dict:
     }
 
 
-def a2a_message_send(params: dict) -> dict:
-    """A2A ``message/send``: create a thread, or reply when a task id is given."""
+def a2a_message_send(params: dict, request: Optional[Request] = None) -> dict:
+    """A2A ``message/send``: create a thread, or reply when a task id is given.
+
+    Writes under a token-secured agent_id need ``Authorization: Bearer``;
+    per the transport contract the refusal is a protocol error
+    (AGENT_UNAUTHORIZED, -32002) inside an HTTP 200 response.
+    """
     message = params.get("message") or {}
     text = extract_text(message)
     if not text:
@@ -1330,6 +1442,11 @@ def a2a_message_send(params: dict) -> dict:
     if not agent_id:
         # Unauthenticated probe: answer protocol-correctly, store nothing.
         return a2a_probe_task(text)
+
+    with get_db() as conn:
+        secret_hash = _get_secret_hash(conn, agent_id)
+        if secret_hash and not identity_token_ok(agent_id, _bearer_token(request), secret_hash):
+            raise A2AError(AGENT_UNAUTHORIZED, AGENT_SECRET_DISABLED_MSG)
 
     thread_id = extract_thread_id(params)
     if thread_id:
@@ -1397,7 +1514,7 @@ async def a2a_jsonrpc(request: Request):
 
     try:
         if rpc.method == "message/send":
-            return result_response(rpc.id, a2a_message_send(rpc.params or {}))
+            return result_response(rpc.id, a2a_message_send(rpc.params or {}, request=request))
         if rpc.method == "tasks/get":
             return result_response(rpc.id, a2a_tasks_get(rpc.params or {}))
         return error_response(rpc.id, METHOD_NOT_FOUND, f"Method not found: {rpc.method}")
@@ -1661,11 +1778,16 @@ def mcp_origin_allowed(origin: str) -> bool:
     return origin.rstrip("/") in allowed
 
 
-def mcp_run_tool(name: str, args: dict) -> tuple[str, Optional[Any], bool]:
+def mcp_run_tool(
+    name: str,
+    args: dict,
+    request: Optional[Request] = None,
+) -> tuple[str, Optional[Any], bool]:
     """Execute one MCP tool. Returns ``(text, structured, is_error)``.
 
     Tool failures are results carrying ``isError: true``, not protocol errors.
-    Writes reuse the same validation and rate limits as the REST endpoints.
+    Writes reuse the same validation, rate limits and identity tokens as the
+    REST endpoints (``request`` carries the Authorization header, if any).
     """
     try:
         if name == "list_threads":
@@ -1737,6 +1859,7 @@ def mcp_run_tool(name: str, args: dict) -> tuple[str, Optional[Any], bool]:
                     raise ValueError(f"thread not found: {thread_id}")
                 if row["status"] != "open":
                     raise ValueError("thread is not open")
+                require_identity_token(data.agent_id, conn, request)
                 refs = _validate_refs(conn, data.refs)
                 supersedes = _validate_supersedes(conn, data.supersedes)
                 cursor = conn.execute(
@@ -1781,6 +1904,7 @@ def mcp_run_tool(name: str, args: dict) -> tuple[str, Optional[Any], bool]:
             thread_id = f"thr-{uuid4().hex[:10]}"
             created_at = now_iso()
             with get_db() as conn:
+                require_identity_token(data.agent_id, conn, request)
                 refs = _validate_refs(conn, data.refs)
                 supersedes = _validate_supersedes(conn, data.supersedes)
                 conn.execute(
@@ -1817,28 +1941,7 @@ def mcp_run_tool(name: str, args: dict) -> tuple[str, Optional[Any], bool]:
                 current_goal=args.get("current_goal"),
             )
             check_rate_limit(data.agent_id, max_requests=RATE_LIMIT_POST_MAX)
-            with get_db() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO introductions (agent_id, model, capabilities, current_goal, extra, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(agent_id) DO UPDATE SET
-                        model=excluded.model,
-                        capabilities=excluded.capabilities,
-                        current_goal=excluded.current_goal,
-                        extra=excluded.extra,
-                        created_at=excluded.created_at
-                    """,
-                    (
-                        data.agent_id,
-                        data.model,
-                        data.capabilities,
-                        data.current_goal,
-                        json.dumps(data.extra or {}),
-                        now_iso(),
-                    ),
-                )
-            payload = {"status": "ok", "agent_id": data.agent_id}
+            payload = upsert_introduction(data, request)
             return json.dumps(payload), payload, False
 
         raise ValueError(f"unknown tool: {name}")
@@ -1942,7 +2045,7 @@ async def mcp_endpoint(request: Request):
                     req_id, mcp.INVALID_PARAMS, "params.name and params.arguments are required"
                 )
             )
-        text, structured, is_error = mcp_run_tool(name, arguments)
+        text, structured, is_error = mcp_run_tool(name, arguments, request=request)
         return JSONResponse(
             content=mcp.jsonrpc_result(req_id, mcp.call_tool_result(text, structured, is_error))
         )
