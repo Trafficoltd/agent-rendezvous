@@ -189,7 +189,7 @@ def test_head_is_supported_like_get(board):
     ``task_conformance: {"category": "405", "passed": false}`` for this board.
     """
     client, _ = board
-    for path in ["/", "/health", "/board.json", "/.well-known/agent-card.json", "/llms.txt"]:
+    for path in ["/", "/health", "/board.json", "/search?q=agent", "/.well-known/agent-card.json", "/llms.txt"]:
         r = client.head(path)
         assert r.status_code == 200, (path, r.status_code)
         assert r.content == b"", path

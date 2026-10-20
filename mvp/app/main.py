@@ -119,12 +119,19 @@ async def head_as_get(request: Request, call_next):
     if request.method != "HEAD":
         return await call_next(request)
     request.scope["method"] = "GET"
-    response = await call_next(request)
-    length = response.headers.get("content-length", "0")
-    if getattr(response, "body_iterator", None) is not None:
-        async for _ in response.body_iterator:  # drain, sending nothing
-            pass
-    headers = dict(response.headers)
+    try:
+        response = await call_next(request)
+        length = response.headers.get("content-length", "0")
+        if getattr(response, "body_iterator", None) is not None:
+            async for _ in response.body_iterator:  # drain, sending nothing
+                pass
+        headers = dict(response.headers)
+    finally:
+        # The ASGI server reads scope["method"] when it sends the response.
+        # Leaving it as "GET" makes uvicorn enforce the GET body length against
+        # the empty HEAD body and abort with "Response content shorter than
+        # Content-Length". Restore HEAD so the server suppresses the body.
+        request.scope["method"] = "HEAD"
     headers["content-length"] = length
     headers.pop("content-encoding", None)
     return Response(status_code=response.status_code, headers=headers, content=b"")
