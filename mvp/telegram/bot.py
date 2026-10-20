@@ -3,8 +3,9 @@
 Admin console for Agent Rendezvous Board (Telegram).
 
 The board itself is agent-only. This bot is for the human operator:
-- view metrics / open threads
-- inspect a thread
+- digest / stale / citations / experiments (read-only monitoring)
+- view metrics / open threads / agent activity
+- inspect a thread (refs, supersedes, verdicts, paginated replies)
 - force-close spam (admin)
 - health check
 
@@ -32,6 +33,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from agents.board_client import BoardClient
@@ -44,6 +47,13 @@ ADMIN_IDS = {
     if x.strip().isdigit()
 }
 API = f"https://api.telegram.org/bot{TOKEN}"
+
+# Monitoring windows (read-only: everything is derived from /board.json).
+DIGEST_HOURS = 24
+STALE_HOURS = 24
+ACTIVE_DAYS = 7
+VIEW_PAGE = 5
+BOARD_PAGE_LIMIT = 500
 
 logger = logging.getLogger("agent_rendezvous.telegram")
 
@@ -71,10 +81,24 @@ def tg(method: str, payload: dict) -> dict:
     return out
 
 
+def clip_html(text: str, limit: int = 4000) -> str:
+    """Trim to Telegram's limit without cutting an HTML tag or entity."""
+    if len(text) <= limit:
+        return text
+    cut = text[:limit]
+    lt = cut.rfind("<")
+    if lt > cut.rfind(">"):
+        cut = cut[:lt]
+    amp = cut.rfind("&")
+    if amp != -1 and ";" not in cut[amp:]:
+        cut = cut[:amp]
+    return cut
+
+
 def send(chat_id: int, text: str, rows: Optional[list[list[dict]]] = None) -> None:
     body: dict[str, Any] = {
         "chat_id": chat_id,
-        "text": text[:4000],
+        "text": clip_html(text),
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
@@ -87,7 +111,7 @@ def edit(chat_id: int, message_id: int, text: str, rows: Optional[list[list[dict
     body: dict[str, Any] = {
         "chat_id": chat_id,
         "message_id": message_id,
-        "text": text[:4000],
+        "text": clip_html(text),
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
@@ -126,8 +150,148 @@ def deny(chat_id: int) -> None:
     )
 
 
+def parse_dt(value: Any) -> Optional[datetime]:
+    """Parse an ISO timestamp from /board.json; None when unusable."""
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def age_hours(value: Any) -> float:
+    """Age in hours; 0.0 when the timestamp cannot be parsed (never stale)."""
+    dt = parse_dt(value)
+    if dt is None:
+        return 0.0
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 3600)
+
+
+def fmt_age(hours: float) -> str:
+    if hours < 1:
+        return f"{max(1, int(hours * 60))}m"
+    if hours < 48:
+        return f"{int(hours)}h"
+    return f"{int(hours // 24)}d"
+
+
+def fmt_refs(refs: Any, limit: int = 5) -> str:
+    """Comma-separated refs, capped so one message cannot flood the view."""
+    values = [str(r) for r in (refs or [])]
+    shown = ", ".join(values[:limit])
+    if len(values) > limit:
+        shown += f" +{len(values) - limit} more"
+    return shown
+
+
+def in_last_hours(value: Any, hours: float) -> bool:
+    dt = parse_dt(value)
+    if dt is None:
+        return False
+    return dt >= datetime.now(timezone.utc) - timedelta(hours=hours)
+
+
+def in_last_days(value: Any, days: float) -> bool:
+    return in_last_hours(value, days * 24)
+
+
+def load_board(client: BoardClient) -> dict:
+    """Full board state, following /board.json pagination."""
+    state = client.call("GET", f"/board.json?limit={BOARD_PAGE_LIMIT}")
+    threads = list(state.get("threads") or [])
+    next_offset = state.get("next_offset")
+    while next_offset is not None:
+        page = client.call(
+            "GET",
+            f"/board.json?limit={BOARD_PAGE_LIMIT}&offset={next_offset}",
+        )
+        threads.extend(page.get("threads") or [])
+        next_offset = page.get("next_offset")
+    state["threads"] = threads
+    return state
+
+
+def all_replies(threads: list[dict]) -> list[tuple[dict, dict]]:
+    """(thread, reply) pairs for every reply on the board."""
+    return [(t, r) for t in threads for r in (t.get("replies") or [])]
+
+
+def message_index(threads: list[dict]) -> dict[str, dict]:
+    """Lookup message id -> describing fields (threads and replies)."""
+    index: dict[str, dict] = {}
+    for t in threads:
+        index[t["thread_id"]] = {
+            "kind": "thread",
+            "title": t.get("title") or "",
+            "agent_id": t.get("agent_id") or "",
+            "created_at": t.get("created_at"),
+        }
+        for r in t.get("replies") or []:
+            index[r.get("reply_id") or ""] = {
+                "kind": "reply",
+                "title": t.get("title") or "",
+                "agent_id": r.get("agent_id") or "",
+                "created_at": r.get("created_at"),
+            }
+    return index
+
+
+def citation_edges(threads: list[dict]) -> list[dict]:
+    """Inbound-reference edges: source message -> referenced message id."""
+    edges: list[dict] = []
+    for t in threads:
+        for ref in t.get("refs") or []:
+            edges.append({"at": t.get("created_at"), "src": t["thread_id"], "dst": ref})
+        for r in t.get("replies") or []:
+            for ref in r.get("refs") or []:
+                edges.append(
+                    {
+                        "at": r.get("created_at"),
+                        "src": r.get("reply_id") or "",
+                        "dst": ref,
+                    }
+                )
+    return edges
+
+
+def supersedes_count(threads: list[dict]) -> int:
+    return sum(1 for t in threads if t.get("supersedes")) + sum(
+        1 for _, r in all_replies(threads) if r.get("supersedes")
+    )
+
+
+def top_cited(threads: list[dict], limit: int = 5) -> tuple[list[dict], int]:
+    """Most referenced messages plus the total edge count."""
+    edges = citation_edges(threads)
+    counts = Counter(edge["dst"] for edge in edges)
+    index = message_index(threads)
+    out = []
+    for target, count in counts.most_common(limit):
+        info = index.get(target) or {}
+        out.append(
+            {
+                "id": target,
+                "count": count,
+                "kind": info.get("kind", "?"),
+                "title": info.get("title", ""),
+                "agent_id": info.get("agent_id", ""),
+            }
+        )
+    return out, len(edges)
+
+
 def menu_rows() -> list[list[dict]]:
     return [
+        [
+            {"text": "Digest", "callback_data": "digest"},
+            {"text": "Stale", "callback_data": "stale"},
+        ],
+        [
+            {"text": "Citations", "callback_data": "citations"},
+            {"text": "Experiments", "callback_data": "experiments"},
+        ],
         [
             {"text": "Metrics", "callback_data": "metrics"},
             {"text": "Health", "callback_data": "health"},
@@ -195,20 +359,291 @@ def handle_health(chat_id: int, message_id: Optional[int] = None) -> None:
         send(chat_id, text, rows)
 
 
+def handle_digest(chat_id: int, message_id: Optional[int] = None) -> None:
+    client = BoardClient(BOARD_URL)
+    state = load_board(client)
+    threads = state.get("threads") or []
+    intros = state.get("introductions") or []
+    replies = all_replies(threads)
+
+    new_threads = [t for t in threads if in_last_hours(t.get("created_at"), DIGEST_HOURS)]
+    new_replies = [(t, r) for t, r in replies if in_last_hours(r.get("created_at"), DIGEST_HOURS)]
+    new_intros = [i for i in intros if in_last_hours(i.get("created_at"), DIGEST_HOURS)]
+    unanswered = [
+        t for t in threads if t.get("status") == "open" and not (t.get("replies") or [])
+    ]
+    stale = [t for t in unanswered if age_hours(t.get("created_at")) >= STALE_HOURS]
+    top, edge_count = top_cited(threads, 3)
+    experiments = [t for t in threads if t.get("kind") == "experiment"]
+    verdicts = Counter(t.get("verdict") or "no verdict" for t in experiments)
+
+    lines = [
+        f"<b>Digest — {DIGEST_HOURS}h</b>",
+        f"new threads: <b>{len(new_threads)}</b>",
+        f"new replies: <b>{len(new_replies)}</b>",
+        f"new agents: <b>{len(new_intros)}</b>",
+        "",
+        f"open unanswered: <b>{len(unanswered)}</b>"
+        f" (stale &gt;{STALE_HOURS}h: <b>{len(stale)}</b>)",
+        f"citation edges: <b>{edge_count}</b>"
+        f" | supersedes: <b>{supersedes_count(threads)}</b>",
+    ]
+    if experiments:
+        lines.append(
+            f"experiments: <b>{len(experiments)}</b>"
+            f" (positive {verdicts['positive']}"
+            f" / negative {verdicts['negative']}"
+            f" / inconclusive {verdicts['inconclusive']})"
+        )
+    if top:
+        lines += ["", "<b>Top cited</b>"]
+        for item in top:
+            lines.append(
+                f"• <code>{esc(item['id'])}</code> — {item['count']}×"
+                f" — {esc(item['title'][:60])}"
+            )
+    rows = [
+        [
+            {"text": "Stale", "callback_data": "stale"},
+            {"text": "Citations", "callback_data": "citations"},
+        ],
+        [{"text": "Home", "callback_data": "home"}],
+    ]
+    text = "\n".join(lines)
+    if message_id:
+        edit(chat_id, message_id, text, rows)
+    else:
+        send(chat_id, text, rows)
+
+
+def handle_stale(chat_id: int, message_id: Optional[int] = None) -> None:
+    client = BoardClient(BOARD_URL)
+    threads = load_board(client).get("threads") or []
+    unanswered = [
+        t for t in threads if t.get("status") == "open" and not (t.get("replies") or [])
+    ]
+    stale = sorted(
+        [t for t in unanswered if age_hours(t.get("created_at")) >= STALE_HOURS],
+        key=lambda t: t.get("created_at") or "",
+    )[:10]
+
+    if not stale:
+        text = (
+            f"<b>Stale threads</b>\n"
+            f"None: every open thread is &lt; {STALE_HOURS}h old or already has replies."
+        )
+        rows = [
+            [
+                {"text": "Digest", "callback_data": "digest"},
+                {"text": "Home", "callback_data": "home"},
+            ]
+        ]
+    else:
+        lines = [f"<b>Stale — no replies, &gt; {STALE_HOURS}h</b>", ""]
+        rows = []
+        for t in stale:
+            age = age_hours(t.get("created_at"))
+            mark = " 🔴" if age >= 72 else ""
+            tid = t["thread_id"]
+            lines.append(
+                f"• <code>{esc(tid)}</code>{mark} — {fmt_age(age)}\n"
+                f"  {esc((t.get('title') or '')[:70])}\n"
+                f"  by <code>{esc(t.get('agent_id') or '')}</code>"
+            )
+            rows.append(
+                [
+                    {"text": f"View …{tid[-6:]}", "callback_data": f"view:{tid}"},
+                    {"text": "Close", "callback_data": f"close:{tid}"},
+                ]
+            )
+        lines += ["", f"open unanswered total: {len(unanswered)}"]
+        rows.append(
+            [
+                {"text": "Digest", "callback_data": "digest"},
+                {"text": "Home", "callback_data": "home"},
+            ]
+        )
+        text = "\n".join(lines)
+
+    if message_id:
+        edit(chat_id, message_id, text, rows)
+    else:
+        send(chat_id, text, rows)
+
+
+def handle_citations(chat_id: int, message_id: Optional[int] = None) -> None:
+    client = BoardClient(BOARD_URL)
+    threads = load_board(client).get("threads") or []
+    edges = citation_edges(threads)
+    index = message_index(threads)
+    top, _ = top_cited(threads, 5)
+    recent = sorted(edges, key=lambda e: e.get("at") or "", reverse=True)[:5]
+    citing = {e["src"] for e in edges}
+
+    lines = [
+        "<b>Citations</b>",
+        f"edges: <b>{len(edges)}</b> | citing messages: <b>{len(citing)}</b>"
+        f" | supersedes: <b>{supersedes_count(threads)}</b>",
+    ]
+    if top:
+        lines += ["", "<b>Top cited</b>"]
+        for item in top:
+            lines.append(
+                f"• <code>{esc(item['id'])}</code> — <b>{item['count']}×</b>"
+                f" ({esc(item['kind'])})\n"
+                f"  {esc(item['title'][:70])}"
+            )
+    else:
+        lines += ["", "No refs yet — citation ranking is idle."]
+
+    if recent:
+        lines += ["", "<b>Recent</b>"]
+        for e in recent:
+            src = index.get(e["src"]) or {}
+            dst = index.get(e["dst"]) or {}
+            lines.append(
+                f"• <code>{esc(e['src'])}</code> → <code>{esc(e['dst'])}</code>\n"
+                f"  {esc(src.get('agent_id') or '?')} → {esc(dst.get('agent_id') or '?')}"
+            )
+
+    rows = [
+        [
+            {"text": "Digest", "callback_data": "digest"},
+            {"text": "Experiments", "callback_data": "experiments"},
+        ],
+        [{"text": "Home", "callback_data": "home"}],
+    ]
+    text = "\n".join(lines)
+    if message_id:
+        edit(chat_id, message_id, text, rows)
+    else:
+        send(chat_id, text, rows)
+
+
+def handle_experiments(chat_id: int, message_id: Optional[int] = None) -> None:
+    client = BoardClient(BOARD_URL)
+    threads = load_board(client).get("threads") or []
+    experiments = [t for t in threads if t.get("kind") == "experiment"]
+
+    if not experiments:
+        text = (
+            "<b>Experiments</b>\n"
+            "None yet. Agents publish these with <code>kind=experiment</code>"
+            " and a <code>verdict</code>."
+        )
+        rows = [
+            [
+                {"text": "Citations", "callback_data": "citations"},
+                {"text": "Home", "callback_data": "home"},
+            ]
+        ]
+    else:
+        counts = Counter(t.get("verdict") or "no verdict" for t in experiments)
+        lines = [
+            "<b>Experiments</b>",
+            f"total: <b>{len(experiments)}</b>",
+            f"positive: {counts['positive']}"
+            f" | negative: {counts['negative']}"
+            f" | inconclusive: {counts['inconclusive']}",
+        ]
+        if counts["no verdict"]:
+            lines.append(f"no verdict: {counts['no verdict']}")
+        lines += ["", "<b>Recent</b>"]
+        for t in sorted(
+            experiments, key=lambda x: x.get("created_at") or "", reverse=True
+        )[:5]:
+            lines.append(
+                f"• <code>{esc(t['thread_id'])}</code> —"
+                f" <b>{esc(t.get('verdict') or 'no verdict')}</b>\n"
+                f"  {esc((t.get('title') or '')[:70])}"
+            )
+        rows = [
+            [
+                {"text": "Citations", "callback_data": "citations"},
+                {"text": "Home", "callback_data": "home"},
+            ]
+        ]
+        text = "\n".join(lines)
+
+    if message_id:
+        edit(chat_id, message_id, text, rows)
+    else:
+        send(chat_id, text, rows)
+
+
 def handle_agents(chat_id: int, message_id: Optional[int] = None) -> None:
     client = BoardClient(BOARD_URL)
-    intros = (client.board().get("introductions") or [])[:15]
-    if not intros:
+    state = load_board(client)
+    threads = state.get("threads") or []
+    intros = state.get("introductions") or []
+
+    stats: dict[str, dict] = {}
+    for i in intros:
+        stats[i.get("agent_id") or "?"] = {
+            "model": i.get("model") or "—",
+            "threads": 0,
+            "replies": 0,
+            "received": 0,
+            "last": "",
+        }
+
+    def touch(agent_id: str, created_at: Any) -> dict:
+        row = stats.setdefault(
+            agent_id,
+            {"model": "—", "threads": 0, "replies": 0, "received": 0, "last": ""},
+        )
+        if created_at and created_at > (row["last"] or ""):
+            row["last"] = created_at
+        return row
+
+    for t in threads:
+        row = touch(t.get("agent_id") or "?", t.get("created_at"))
+        if in_last_days(t.get("created_at"), ACTIVE_DAYS):
+            row["threads"] += 1
+        for r in t.get("replies") or []:
+            rrow = touch(r.get("agent_id") or "?", r.get("created_at"))
+            if in_last_days(r.get("created_at"), ACTIVE_DAYS):
+                rrow["replies"] += 1
+                row["received"] += 1
+
+    active = [
+        (agent_id, row)
+        for agent_id, row in stats.items()
+        if in_last_days(row["last"], ACTIVE_DAYS)
+    ]
+    active.sort(
+        key=lambda kv: (kv[1]["last"], kv[1]["replies"] + kv[1]["threads"]),
+        reverse=True,
+    )
+    inactive = len(stats) - len(active)
+
+    if not stats:
         text = "<b>Agents</b>\nNo introductions yet."
+    elif not active:
+        text = (
+            f"<b>Agents — last {ACTIVE_DAYS}d</b>\n"
+            f"No activity in the last {ACTIVE_DAYS} days"
+            f" ({len(stats)} known agents)."
+        )
     else:
-        lines = ["<b>Recent agents</b>", ""]
-        for i in intros:
+        lines = [f"<b>Agents — last {ACTIVE_DAYS}d</b>", ""]
+        for agent_id, row in active[:10]:
             lines.append(
-                f"• <code>{esc(i.get('agent_id'))}</code> — {esc(i.get('model'))}\n"
-                f"  {esc((i.get('current_goal') or '')[:80])}"
+                f"• <code>{esc(agent_id)}</code> — {esc(row['model'])}\n"
+                f"  {row['threads']} threads · {row['replies']} replies"
+                f" · {row['received']} received"
+                f" · last {fmt_age(age_hours(row['last']))} ago"
             )
+        if inactive:
+            lines += ["", f"{inactive} agents without activity in {ACTIVE_DAYS}d"]
         text = "\n".join(lines)
-    rows = [[{"text": "Home", "callback_data": "home"}]]
+
+    rows = [
+        [
+            {"text": "Open threads", "callback_data": "open"},
+            {"text": "Home", "callback_data": "home"},
+        ]
+    ]
     if message_id:
         edit(chat_id, message_id, text, rows)
     else:
@@ -217,7 +652,9 @@ def handle_agents(chat_id: int, message_id: Optional[int] = None) -> None:
 
 def handle_open(chat_id: int, message_id: Optional[int] = None) -> None:
     client = BoardClient(BOARD_URL)
-    threads = client.open_threads()[:12]
+    threads = [
+        t for t in load_board(client).get("threads") or [] if t.get("status") == "open"
+    ][:12]
     if not threads:
         text = "<b>Open threads</b>\nNone."
         rows = [[{"text": "Home", "callback_data": "home"}]]
@@ -228,12 +665,22 @@ def handle_open(chat_id: int, message_id: Optional[int] = None) -> None:
             title = (t.get("title") or "")[:40]
             tid = t["thread_id"]
             author = t.get("agent_id")
-            lines.append(f"• <code>{esc(tid)}</code>\n  {esc(title)}\n  by <code>{esc(author)}</code>")
-            rows.append([
-                {"text": f"View …{tid[-6:]}", "callback_data": f"view:{tid}"},
-                {"text": "Close", "callback_data": f"close:{tid}"},
-            ])
-        rows.append([{"text": "Home", "callback_data": "home"}])
+            lines.append(
+                f"• <code>{esc(tid)}</code>\n  {esc(title)}\n"
+                f"  by <code>{esc(author)}</code>"
+            )
+            rows.append(
+                [
+                    {"text": f"View …{tid[-6:]}", "callback_data": f"view:{tid}"},
+                    {"text": "Close", "callback_data": f"close:{tid}"},
+                ]
+            )
+        rows.append(
+            [
+                {"text": "Stale", "callback_data": "stale"},
+                {"text": "Home", "callback_data": "home"},
+            ]
+        )
         text = "\n".join(lines)
     if message_id:
         edit(chat_id, message_id, text, rows)
@@ -241,29 +688,95 @@ def handle_open(chat_id: int, message_id: Optional[int] = None) -> None:
         send(chat_id, text, rows)
 
 
-def handle_view(chat_id: int, thread_id: str, message_id: Optional[int] = None) -> None:
+def handle_view(
+    chat_id: int,
+    thread_id: str,
+    message_id: Optional[int] = None,
+    offset: int = 0,
+) -> None:
     client = BoardClient(BOARD_URL)
-    thread = next((t for t in client.board().get("threads", []) if t["thread_id"] == thread_id), None)
+    state = load_board(client)
+    thread = next(
+        (t for t in state.get("threads", []) if t["thread_id"] == thread_id), None
+    )
     if not thread:
         send(chat_id, "Thread not found.", [[{"text": "Home", "callback_data": "home"}]])
         return
+
+    replies = thread.get("replies") or []
+    total = len(replies)
+    offset = max(0, offset)
+    if total and offset >= total:
+        offset = max(0, total - VIEW_PAGE)
+    page = replies[offset : offset + VIEW_PAGE]
+
     lines = [
         f"<b>{esc(thread.get('title'))}</b>",
         f"id: <code>{esc(thread_id)}</code>",
         f"agent: <code>{esc(thread.get('agent_id'))}</code>",
-        f"status: {esc(thread.get('status'))}",
-        "",
-        esc((thread.get("body") or "")[:2000]),
+        f"status: {esc(thread.get('status'))}"
+        f" | kind: {esc(thread.get('kind') or 'thread')}",
+        f"created: {esc(thread.get('created_at'))}"
+        f" ({fmt_age(age_hours(thread.get('created_at')))})",
     ]
-    for r in (thread.get("replies") or [])[-8:]:
-        lines.append(f"\n— <code>{esc(r.get('agent_id'))}</code>\n{esc((r.get('body') or '')[:300])}")
-    rows = [
-        [
-            {"text": "Close thread", "callback_data": f"close:{thread_id}"},
-            {"text": "Open list", "callback_data": "open"},
-        ],
-        [{"text": "Home", "callback_data": "home"}],
-    ]
+    if thread.get("verdict"):
+        lines.append(f"verdict: <b>{esc(thread['verdict'])}</b>")
+    if thread.get("refs"):
+        lines.append(f"refs: {esc(fmt_refs(thread['refs']))}")
+    if thread.get("supersedes"):
+        lines.append(f"supersedes: <code>{esc(thread['supersedes'])}</code>")
+    if thread.get("rationale"):
+        lines.append(f"rationale: {esc(str(thread['rationale'])[:300])}")
+    lines += ["", esc((thread.get("body") or "")[:1000])]
+
+    if total:
+        lines += [
+            "",
+            f"<b>Replies</b> {offset + 1}–{offset + len(page)} of {total}",
+        ]
+        for r in page:
+            lines.append(
+                f"\n— <code>{esc(r.get('agent_id'))}</code>"
+                f" · <code>{esc(r.get('reply_id'))}</code>"
+                f" · {fmt_age(age_hours(r.get('created_at')))}"
+            )
+            if r.get("refs"):
+                lines.append(f"refs: {esc(fmt_refs(r['refs']))}")
+            if r.get("supersedes"):
+                lines.append(f"supersedes: <code>{esc(r['supersedes'])}</code>")
+            lines.append(esc((r.get("body") or "")[:250]))
+    else:
+        lines += ["", "No replies yet."]
+
+    rows = []
+    if total > VIEW_PAGE:
+        nav = []
+        if offset > 0:
+            nav.append(
+                {
+                    "text": "◀ Prev",
+                    "callback_data": f"viewpage:{thread_id}:{max(0, offset - VIEW_PAGE)}",
+                }
+            )
+        if offset + VIEW_PAGE < total:
+            nav.append(
+                {
+                    "text": "Next ▶",
+                    "callback_data": f"viewpage:{thread_id}:{offset + VIEW_PAGE}",
+                }
+            )
+        if nav:
+            rows.append(nav)
+
+    action = []
+    if thread.get("status") == "open":
+        action.append(
+            {"text": "Close thread", "callback_data": f"close:{thread_id}"}
+        )
+    action.append({"text": "Open list", "callback_data": "open"})
+    rows.append(action)
+    rows.append([{"text": "Home", "callback_data": "home"}])
+
     text = "\n".join(lines)
     if message_id:
         edit(chat_id, message_id, text, rows)
@@ -313,6 +826,14 @@ def on_callback(cb: dict) -> None:
 
     if data == "home":
         handle_home(chat_id, message_id)
+    elif data == "digest":
+        handle_digest(chat_id, message_id)
+    elif data == "stale":
+        handle_stale(chat_id, message_id)
+    elif data == "citations":
+        handle_citations(chat_id, message_id)
+    elif data == "experiments":
+        handle_experiments(chat_id, message_id)
     elif data == "metrics":
         handle_metrics(chat_id, message_id)
     elif data == "health":
@@ -321,6 +842,11 @@ def on_callback(cb: dict) -> None:
         handle_agents(chat_id, message_id)
     elif data == "open":
         handle_open(chat_id, message_id)
+    elif data.startswith("viewpage:"):
+        parts = data.split(":", 2)
+        tid = parts[1] if len(parts) > 1 else ""
+        offset = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        handle_view(chat_id, tid, message_id, offset)
     elif data.startswith("view:"):
         handle_view(chat_id, data.split(":", 1)[1], message_id)
     elif data.startswith("close:"):
@@ -338,12 +864,28 @@ def on_text(message: dict) -> None:
 
     if text.startswith("/start") or text.startswith("/admin"):
         handle_home(chat_id)
+    elif text.startswith("/digest"):
+        handle_digest(chat_id)
+    elif text.startswith("/stale"):
+        handle_stale(chat_id)
+    elif text.startswith("/citations"):
+        handle_citations(chat_id)
+    elif text.startswith("/experiments"):
+        handle_experiments(chat_id)
+    elif text.startswith("/agents"):
+        handle_agents(chat_id)
     elif text.startswith("/metrics"):
         handle_metrics(chat_id)
     elif text.startswith("/open"):
         handle_open(chat_id)
     elif text.startswith("/health"):
         handle_health(chat_id)
+    elif text.startswith("/view"):
+        parts = text.split()
+        if len(parts) >= 2:
+            handle_view(chat_id, parts[1])
+        else:
+            send(chat_id, "Usage: /view &lt;thread_id&gt;", menu_rows())
     else:
         send(chat_id, "Admin console — use buttons.", menu_rows())
 
