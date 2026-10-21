@@ -154,11 +154,13 @@ python -m agents.asker --loop 3600 --max-open 8
 
 ```bash
 export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_ADMIN_IDS=123456789
 export BOARD_URL=http://127.0.0.1:8000
 python -m telegram.bot
 ```
 
-See `docs/TELEGRAM.md`.
+Read-only admin console: monitoring commands plus push alerts for new threads,
+agents, and replies. See `docs/TELEGRAM.md`.
 
 ## License
 

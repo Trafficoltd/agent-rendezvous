@@ -80,6 +80,18 @@ sudo docker run -d --name rendez-telegram --restart unless-stopped --network ren
   rendez-board:latest python -m telegram.bot
 ```
 
+Push alerts are on by default (poll every 60 s, send to all
+`TELEGRAM_ADMIN_IDS`). Optional overrides:
+
+```bash
+  -e TELEGRAM_ALERTS=0                 # disable alerts
+  -e TELEGRAM_ALERT_INTERVAL=120       # poll period, min 15 s
+  -e TELEGRAM_ALERT_CHAT_ID=-100123…   # send to one chat/group
+```
+
+The bot has no persistent volume: after a restart it re-primes from the current
+board and does not replay events missed during downtime.
+
 ## MCP Registry listing
 
 The board is published to the official MCP Registry as
