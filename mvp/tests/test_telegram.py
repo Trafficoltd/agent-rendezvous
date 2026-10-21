@@ -440,3 +440,158 @@ def test_callback_routes_monitoring_buttons(monkeypatch):
         ("view:thr-1:5", 9, 77),
         ("view:thr-1:0", 9, 77),
     ]
+
+
+def test_monitor_primes_silently_and_detects_new_items():
+    base = {
+        "introductions": [
+            {"agent_id": "a-1", "model": "m1", "created_at": iso(10)}
+        ],
+        "threads": [thread("thr-1", 10, replies=[reply("rep-1", 9)])],
+    }
+    monitor = tgbot.BoardMonitor()
+    monitor.prime(base)
+    assert monitor.pending(base) == {"threads": [], "replies": [], "agents": []}
+
+    new = {
+        "introductions": base["introductions"]
+        + [{"agent_id": "a-2", "model": "m2", "created_at": iso(1)}],
+        "threads": base["threads"]
+        + [
+            thread(
+                "thr-2",
+                1,
+                agent="a-2",
+                replies=[reply("rep-2", 0, agent="a-2")],
+            )
+        ],
+    }
+    events = monitor.pending(new)
+
+    assert [t["thread_id"] for t in events["threads"]] == ["thr-2"]
+    assert [r["reply_id"] for _, r in events["replies"]] == ["rep-2"]
+    assert [i["agent_id"] for i in events["agents"]] == ["a-2"]
+
+    monitor.commit(events)
+    assert monitor.pending(new) == {"threads": [], "replies": [], "agents": []}
+
+
+class SeqClient:
+    def __init__(self, states: list[dict]):
+        self.states = list(states)
+
+    def call(self, method: str, path: str, body: dict | None = None) -> dict:
+        assert path.startswith("/board.json")
+        return self.states.pop(0)
+
+
+def test_check_board_once_primes_then_alerts(monkeypatch):
+    base = {
+        "introductions": [],
+        "threads": [thread("thr-1", 10)],
+    }
+    new = {
+        "introductions": [],
+        "threads": base["threads"] + [thread("thr-2", 1)],
+    }
+    monitor = tgbot.BoardMonitor()
+    sent: list[dict] = []
+    monkeypatch.setattr(tgbot, "send_alert", lambda events: sent.append(events))
+
+    assert tgbot.check_board_once(monitor, SeqClient([base])) is None
+    assert sent == []
+
+    events = tgbot.check_board_once(monitor, SeqClient([new]))
+
+    assert events is not None
+    assert [t["thread_id"] for t in events["threads"]] == ["thr-2"]
+    assert len(sent) == 1
+    assert tgbot.check_board_once(monitor, SeqClient([new])) is None
+    assert len(sent) == 1
+
+
+def test_format_alert_has_sections_and_view_buttons():
+    events = {
+        "threads": [thread("thr-1", 1, title="<b>new</b> thread")],
+        "replies": [(thread("thr-2", 2), reply("rep-1", 0, agent="a-2"))],
+        "agents": [
+            {
+                "agent_id": "a-3",
+                "model": "m3",
+                "current_goal": "ship alerts",
+                "created_at": iso(1),
+            }
+        ],
+    }
+
+    text, rows = tgbot.format_alert(events)
+
+    assert "New threads" in text
+    assert "&lt;b&gt;new&lt;/b&gt; thread" in text
+    assert "New replies" in text and "rep-1" in text
+    assert "New agents" in text and "a-3" in text and "ship alerts" in text
+    callbacks = [b["callback_data"] for row in rows for b in row]
+    assert "view:thr-1" in callbacks
+    assert "view:thr-2" in callbacks
+    assert "open" in callbacks
+
+
+def test_format_alert_caps_each_type():
+    events = {
+        "threads": [thread(f"thr-{i}", i) for i in range(15)],
+        "replies": [],
+        "agents": [],
+    }
+
+    text, rows = tgbot.format_alert(events)
+
+    assert text.count("• ") == 5
+    assert "… +10 more threads" in text
+    assert len(rows) == 6  # 5 thread buttons + footer
+
+
+def test_alert_chat_ids_prefers_explicit_chat(monkeypatch):
+    monkeypatch.setattr(tgbot, "ALERT_CHAT_ID", "-100123")
+    monkeypatch.setattr(tgbot, "ADMIN_IDS", {1, 2})
+
+    assert tgbot.alert_chat_ids() == [-100123]
+
+
+def test_alert_chat_ids_defaults_to_all_admins(monkeypatch):
+    monkeypatch.setattr(tgbot, "ALERT_CHAT_ID", "")
+    monkeypatch.setattr(tgbot, "ADMIN_IDS", {2, 1})
+
+    assert tgbot.alert_chat_ids() == [1, 2]
+
+
+def test_send_alert_sends_to_each_admin(monkeypatch, captured):
+    monkeypatch.setattr(tgbot, "ALERT_CHAT_ID", "")
+    monkeypatch.setattr(tgbot, "ADMIN_IDS", {1, 2})
+
+    tgbot.send_alert(
+        {
+            "threads": [thread("thr-1", 1)],
+            "replies": [],
+            "agents": [],
+        }
+    )
+
+    assert len(captured.texts) == 2
+    assert "New threads" in captured.texts[0]
+
+
+def test_send_alert_survives_a_failed_chat(monkeypatch):
+    sent: list[int] = []
+
+    def flaky(chat_id, text, rows=None):
+        if chat_id == 1:
+            raise RuntimeError("blocked")
+        sent.append(chat_id)
+
+    monkeypatch.setattr(tgbot, "send", flaky)
+    monkeypatch.setattr(tgbot, "ALERT_CHAT_ID", "")
+    monkeypatch.setattr(tgbot, "ADMIN_IDS", {1, 2})
+
+    tgbot.send_alert({"threads": [thread("thr-1", 1)], "replies": [], "agents": []})
+
+    assert sent == [2]

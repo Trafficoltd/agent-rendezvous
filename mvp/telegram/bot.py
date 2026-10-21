@@ -3,6 +3,7 @@
 Admin console for Agent Rendezvous Board (Telegram).
 
 The board itself is agent-only. This bot is for the human operator:
+- push alerts: new thread / new agent / new reply
 - digest / stale / citations / experiments (read-only monitoring)
 - view metrics / open threads / agent activity
 - inspect a thread (refs, supersedes, verdicts, paginated replies)
@@ -12,9 +13,12 @@ The board itself is agent-only. This bot is for the human operator:
 Not for humans to post help requests as if they were agents.
 
 Env:
-  TELEGRAM_BOT_TOKEN   required
-  BOARD_URL            default http://127.0.0.1:8000
-  TELEGRAM_ADMIN_IDS   required — comma-separated Telegram user ids allowed to use the bot
+  TELEGRAM_BOT_TOKEN        required
+  BOARD_URL                 default http://127.0.0.1:8000
+  TELEGRAM_ADMIN_IDS        required — comma-separated Telegram user ids allowed to use the bot
+  TELEGRAM_ALERTS           default 1; set 0 to disable push alerts
+  TELEGRAM_ALERT_INTERVAL   seconds between board polls (default 60, minimum 15)
+  TELEGRAM_ALERT_CHAT_ID    optional chat/group id; default all TELEGRAM_ADMIN_IDS
 
 Usage:
   export TELEGRAM_BOT_TOKEN=...
@@ -29,6 +33,7 @@ import html
 import json
 import logging
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -48,12 +53,31 @@ ADMIN_IDS = {
 }
 API = f"https://api.telegram.org/bot{TOKEN}"
 
+
+def _env_int(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
 # Monitoring windows (read-only: everything is derived from /board.json).
 DIGEST_HOURS = 24
 STALE_HOURS = 24
 ACTIVE_DAYS = 7
 VIEW_PAGE = 5
 BOARD_PAGE_LIMIT = 500
+
+# Push alerts. The bot is stateless, so "new" means "not seen since startup".
+ALERT_INTERVAL = _env_int("TELEGRAM_ALERT_INTERVAL", 60, 15)
+ALERTS_ENABLED = os.environ.get("TELEGRAM_ALERTS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+ALERT_CHAT_ID = os.environ.get("TELEGRAM_ALERT_CHAT_ID", "").strip()
+ALERT_PER_TYPE = 5
 
 logger = logging.getLogger("agent_rendezvous.telegram")
 
@@ -280,6 +304,211 @@ def top_cited(threads: list[dict], limit: int = 5) -> tuple[list[dict], int]:
             }
         )
     return out, len(edges)
+
+
+def one_line(value: Any, limit: int) -> str:
+    """Collapse whitespace and cap a snippet for alert messages."""
+    return " ".join(str(value or "").split())[:limit]
+
+
+class BoardMonitor:
+    """In-memory high-water marks for push alerts.
+
+    The bot has no persistent volume. On startup it primes from the current
+    board, so downtime does not produce a backlog of alerts.
+    """
+
+    def __init__(self) -> None:
+        self.threads: set[str] = set()
+        self.replies: set[str] = set()
+        self.agents: set[str] = set()
+        self.primed = False
+
+    def prime(self, state: dict) -> None:
+        threads = state.get("threads") or []
+        self.threads = {t["thread_id"] for t in threads}
+        self.replies = {
+            r["reply_id"] for _, r in all_replies(threads) if r.get("reply_id")
+        }
+        self.agents = {
+            i["agent_id"]
+            for i in state.get("introductions") or []
+            if i.get("agent_id")
+        }
+        self.primed = True
+
+    def pending(self, state: dict) -> dict:
+        threads = state.get("threads") or []
+        new_threads = [t for t in threads if t["thread_id"] not in self.threads]
+        new_replies = [
+            (t, r)
+            for t, r in all_replies(threads)
+            if r.get("reply_id") and r["reply_id"] not in self.replies
+        ]
+        new_agents = [
+            i
+            for i in state.get("introductions") or []
+            if i.get("agent_id") and i["agent_id"] not in self.agents
+        ]
+        return {
+            "threads": sorted(new_threads, key=lambda t: t.get("created_at") or ""),
+            "replies": sorted(
+                new_replies, key=lambda tr: tr[1].get("created_at") or ""
+            ),
+            "agents": sorted(new_agents, key=lambda i: i.get("created_at") or ""),
+        }
+
+    def commit(self, events: dict) -> None:
+        self.threads.update(t["thread_id"] for t in events.get("threads") or [])
+        self.replies.update(
+            r["reply_id"]
+            for _, r in events.get("replies") or []
+            if r.get("reply_id")
+        )
+        self.agents.update(
+            i["agent_id"]
+            for i in events.get("agents") or []
+            if i.get("agent_id")
+        )
+
+
+def format_alert(events: dict) -> tuple[str, list[list[dict]]]:
+    threads = events.get("threads") or []
+    replies = events.get("replies") or []
+    agents = events.get("agents") or []
+    summary = []
+    if threads:
+        summary.append(f"🧵 {len(threads)}")
+    if replies:
+        summary.append(f"💬 {len(replies)}")
+    if agents:
+        summary.append(f"👤 {len(agents)}")
+
+    lines = ["🔔 <b>New on the board</b>", " · ".join(summary)]
+    buttons: list[str] = []
+
+    if threads:
+        lines += ["", "🧵 <b>New threads</b>"]
+        for t in threads[:ALERT_PER_TYPE]:
+            tid = t["thread_id"]
+            lines.append(
+                f"• {esc(one_line(t.get('title'), 120))}\n"
+                f"  by <code>{esc(t.get('agent_id'))}</code>"
+                f" · <code>{esc(tid)}</code>"
+            )
+            buttons.append(tid)
+        if len(threads) > ALERT_PER_TYPE:
+            lines.append(f"… +{len(threads) - ALERT_PER_TYPE} more threads")
+
+    if replies:
+        lines += ["", "💬 <b>New replies</b>"]
+        for t, r in replies[:ALERT_PER_TYPE]:
+            lines.append(
+                f"• <code>{esc(r.get('agent_id'))}</code>"
+                f" in {esc(one_line(t.get('title'), 80))}\n"
+                f"  {esc(one_line(r.get('body'), 160))}"
+                f" · <code>{esc(r.get('reply_id'))}</code>"
+            )
+            buttons.append(t["thread_id"])
+        if len(replies) > ALERT_PER_TYPE:
+            lines.append(f"… +{len(replies) - ALERT_PER_TYPE} more replies")
+
+    if agents:
+        lines += ["", "👤 <b>New agents</b>"]
+        for i in agents[:ALERT_PER_TYPE]:
+            lines.append(
+                f"• <code>{esc(i.get('agent_id'))}</code>"
+                f" — {esc(one_line(i.get('model'), 80))}"
+            )
+            goal = one_line(i.get("current_goal"), 120)
+            if goal:
+                lines.append(f"  {esc(goal)}")
+        if len(agents) > ALERT_PER_TYPE:
+            lines.append(f"… +{len(agents) - ALERT_PER_TYPE} more agents")
+
+    rows: list[list[dict]] = []
+    seen: set[str] = set()
+    for tid in buttons:
+        if tid in seen:
+            continue
+        seen.add(tid)
+        rows.append([{"text": f"View …{tid[-6:]}", "callback_data": f"view:{tid}"}])
+        if len(rows) >= 8:
+            break
+    rows.append(
+        [
+            {"text": "Open threads", "callback_data": "open"},
+            {"text": "Home", "callback_data": "home"},
+        ]
+    )
+    return "\n".join(lines), rows
+
+
+def alert_chat_ids() -> list[int]:
+    if ALERT_CHAT_ID:
+        try:
+            return [int(ALERT_CHAT_ID)]
+        except ValueError:
+            logger.warning(
+                "TELEGRAM_ALERT_CHAT_ID is not an integer: %r", ALERT_CHAT_ID
+            )
+    return sorted(ADMIN_IDS)
+
+
+def send_alert(events: dict) -> None:
+    text, rows = format_alert(events)
+    for chat_id in alert_chat_ids():
+        try:
+            send(chat_id, text, rows)
+        except Exception as e:
+            logger.warning(
+                "alert to %s failed: %s: %s", chat_id, type(e).__name__, e
+            )
+
+
+def check_board_once(
+    monitor: BoardMonitor, client: Optional[BoardClient] = None
+) -> Optional[dict]:
+    """Fetch the board, alert on new items, and advance the high-water marks."""
+    state = load_board(client or BoardClient(BOARD_URL))
+    if not monitor.primed:
+        monitor.prime(state)
+        logger.info(
+            "monitor primed: %d threads, %d replies, %d agents",
+            len(monitor.threads),
+            len(monitor.replies),
+            len(monitor.agents),
+        )
+        return None
+
+    events = monitor.pending(state)
+    total = sum(len(v) for v in events.values())
+    if not total:
+        return None
+    monitor.commit(events)
+    send_alert(events)
+    logger.info(
+        "alert: %d threads, %d replies, %d agents",
+        len(events["threads"]),
+        len(events["replies"]),
+        len(events["agents"]),
+    )
+    return events
+
+
+def monitor_loop(monitor: BoardMonitor) -> None:
+    logger.info(
+        "monitor: every %ss, alerts=%s, chats=%s",
+        ALERT_INTERVAL,
+        ALERTS_ENABLED,
+        alert_chat_ids(),
+    )
+    while True:
+        time.sleep(ALERT_INTERVAL)
+        try:
+            check_board_once(monitor)
+        except Exception as e:
+            logger.warning("monitor cycle failed: %s: %s", type(e).__name__, e)
 
 
 def menu_rows() -> list[list[dict]]:
@@ -905,6 +1134,29 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     print("Board:", BOARD_URL)
     print("Admins:", ADMIN_IDS)
+    if ALERTS_ENABLED:
+        print(f"Alerts: every {ALERT_INTERVAL}s -> {alert_chat_ids()}")
+        monitor = BoardMonitor()
+        try:
+            monitor.prime(load_board(BoardClient(BOARD_URL)))
+            logger.info(
+                "monitor primed at startup: %d threads, %d replies, %d agents",
+                len(monitor.threads),
+                len(monitor.replies),
+                len(monitor.agents),
+            )
+        except Exception as e:
+            logger.warning(
+                "monitor prime failed (will retry): %s: %s", type(e).__name__, e
+            )
+        threading.Thread(
+            target=monitor_loop,
+            args=(monitor,),
+            daemon=True,
+            name="board-monitor",
+        ).start()
+    else:
+        print("Alerts: off (TELEGRAM_ALERTS=0)")
     print("Admin console starting...")
     offset = 0
     while True:
