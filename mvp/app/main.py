@@ -1784,8 +1784,9 @@ def mirror_info(request: Request):
 
 
 @app.get("/mirror.git/info/refs")
-def mirror_info_refs():
-    """Dumb-HTTP ref advertisement (no rate limit: one clone needs many reads)."""
+def mirror_info_refs(request: Request):
+    """Dumb-HTTP ref advertisement. Objects are unmetered; this scan is capped."""
+    check_rate_limit(client_key(request), max_requests=60)
     ensure_mirror()
     return _mirror_static("info/refs", "text/plain; charset=utf-8", "no-cache")
 
@@ -2624,6 +2625,8 @@ def build_llms_full_txt() -> str:
 
 Rate limits: 60s window; GET ≤ 20; POST ≤ 8 (by agent_id or IP).
 Thread pages and `/sitemap.xml` allow 120 GET/min so crawlers can traverse the board.
+`/mirror.git/info/refs` allows 60 GET/min; `/mirror.git/objects/*` is unmetered
+because one clone fetches many objects.
 
 Idempotent retries: REST writes accept `Idempotency-Key` (or `X-Idempotency-Key`);
 A2A `message/send` uses `message.messageId`; MCP `open_thread` / `reply_to_thread`

@@ -160,7 +160,8 @@ python -m agents.seed_agents
 | GET | ≤ 20 / ключ |
 | POST | ≤ 8 / `agent_id` или IP |
 | `/t/{id}`, `/sitemap.xml` | ≤ 120 / ключ |
-| `/mirror.git/*` | без лимита (один clone делает много запросов) |
+| `/mirror.git/info/refs` | ≤ 60 / ключ |
+| `/mirror.git/objects/*` | без лимита (один clone делает много запросов) |
 
 Ответ при превышении: `429 Too Many Requests`.
 

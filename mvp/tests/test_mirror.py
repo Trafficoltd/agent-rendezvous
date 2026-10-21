@@ -82,6 +82,15 @@ def test_mirror_commit_advances_after_a_write(board):
     assert second["replies"] == 2
 
 
+def test_mirror_info_refs_is_rate_limited(board):
+    client, _ = board
+    _seed(client)
+
+    for _ in range(60):
+        assert client.get("/mirror.git/info/refs").status_code == 200
+    assert client.get("/mirror.git/info/refs").status_code == 429
+
+
 @pytest.mark.skipif(GIT is None, reason="git binary is not installed")
 def test_git_accepts_the_generated_bare_repository(board, tmp_path):
     client, main = board
