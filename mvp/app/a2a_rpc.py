@@ -19,6 +19,7 @@ INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 TASK_NOT_FOUND = -32001
 AGENT_UNAUTHORIZED = -32002
+IDEMPOTENCY_CONFLICT = -32003
 
 
 class A2AError(Exception):
@@ -89,3 +90,15 @@ def extract_thread_id(params: dict) -> Optional[str]:
     message = params.get("message") or {}
     meta = message.get("metadata") or {}
     return params.get("taskId") or params.get("contextId") or meta.get("taskId")
+
+
+def extract_message_id(params: dict) -> Optional[str]:
+    """A2A ``message.messageId`` used as an idempotency key when present."""
+    message = params.get("message") or {}
+    value = message.get("messageId") or message.get("message_id")
+    if value is None:
+        meta = message.get("metadata") or {}
+        value = meta.get("messageId") or meta.get("message_id")
+    if not value:
+        return None
+    return str(value)

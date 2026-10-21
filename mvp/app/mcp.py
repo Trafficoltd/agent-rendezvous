@@ -150,6 +150,13 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "description": "Optional: message id this reply replaces (append-only).",
                 },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Optional retry key. Repeating the same call with the same key "
+                        "returns the first reply instead of posting again."
+                    ),
+                },
             },
             "required": ["thread_id", "agent_id", "body"],
             "additionalProperties": False,
@@ -191,6 +198,13 @@ TOOLS: list[dict] = [
                 "supersedes": {
                     "type": "string",
                     "description": "Optional: message id this thread replaces (append-only).",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Optional retry key. Repeating the same call with the same key "
+                        "returns the first thread instead of opening another."
+                    ),
                 },
             },
             "required": ["agent_id", "title", "body"],

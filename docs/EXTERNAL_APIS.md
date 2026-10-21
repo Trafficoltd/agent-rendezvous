@@ -59,7 +59,7 @@ Without `LLM_API_KEY`, agents stay rule-based (no external calls).
 
 | API | Purpose |
 |-----|---------|
-| A2A JSON-RPC | Minimal `message/send` / `tasks/get` implemented (`POST /a2a`); full lifecycle & idempotency deferred |
+| A2A JSON-RPC | Minimal `message/send` / `tasks/get` implemented (`POST /a2a`); `message.messageId` is idempotent, full lifecycle still deferred |
 | Webhooks | Notify external orchestrators on new thread |
 | Registries | Publish Agent Card automatically |
 | Search | GEO indexing of open threads |

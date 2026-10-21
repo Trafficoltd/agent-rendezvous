@@ -4,29 +4,34 @@ Markdown page + SQLite storage + basic protection
 """
 
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 from uuid import uuid4
 from collections import defaultdict
 import hashlib
 import hmac
+import html
 import logging
 import math
 import re
 import sqlite3
+import threading
+import zlib
 import asyncio
 import json
 import os
 import time
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field, ValidationError
 
 import app.mcp as mcp
 from app.a2a_rpc import (
     AGENT_UNAUTHORIZED,
+    IDEMPOTENCY_CONFLICT,
     INTERNAL_ERROR,
     INVALID_PARAMS,
     INVALID_REQUEST,
@@ -38,6 +43,7 @@ from app.a2a_rpc import (
     JsonRpcRequest,
     error_response,
     extract_agent_id,
+    extract_message_id,
     extract_text,
     extract_thread_id,
     extract_title,
@@ -92,6 +98,22 @@ CITATION_MIX = 0.3            # score = 0.7 * relevance + 0.3 * citations
 CITATION_HALF_LIFE_DAYS = 30  # citation weight halves every 30 days
 MAX_REFS = 32                 # inbound/outbound reference cap per message
 REF_MAX_LEN = 128
+
+# Idempotent retries: an optional client key turns a duplicate POST into a
+# replay of the first response instead of a second thread/reply/status note.
+IDEMPOTENCY_HEADER = "Idempotency-Key"
+IDEMPOTENCY_ALT_HEADER = "X-Idempotency-Key"
+IDEMPOTENCY_KEY_MAX = 128
+IDEMPOTENCY_KEY_RE = re.compile(r"^[!-~]{1,128}$")
+IDEMPOTENCY_TTL_DAYS = 7
+
+# Read-only Git mirror. The image intentionally has no git binary, so the
+# mirror is written as content-addressed loose objects with stdlib zlib/sha1.
+MIRROR_DIR = DB_PATH.parent / "mirror.git"
+MIRROR_STATE_PATH = DB_PATH.parent / "mirror-state.json"
+MIRROR_BRANCH = "main"
+MIRROR_AUTHOR = "Agent Rendezvous Board <board@rendezboard.online>"
+_MIRROR_LOCK = threading.Lock()
 
 logger = logging.getLogger("agent_rendezvous.board")
 
@@ -337,6 +359,30 @@ def init_db():
                 """
             )
 
+        # ---- Idempotency: replay-safe retries for public writes ------------
+        # The body of a successful write is stored so a retry with the same key
+        # returns exactly the first result. The scope binds a key to one
+        # operation; reusing it elsewhere is a 409, not a silent replay.
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS idempotency_keys (
+            agent_id TEXT NOT NULL,
+            idem_key TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            status_code INTEGER NOT NULL,
+            response TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (agent_id, idem_key)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_idempotency_created
+            ON idempotency_keys(created_at);
+        """)
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=IDEMPOTENCY_TTL_DAYS)
+        ).isoformat()
+        conn.execute("DELETE FROM idempotency_keys WHERE created_at < ?", (cutoff,))
+
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -478,6 +524,129 @@ def require_identity_token(agent_id: str, conn, request: Optional[Request]) -> N
     token = _bearer_token(request)
     if not identity_token_ok(agent_id, token, secret_hash):
         raise HTTPException(status_code=401, detail=AGENT_SECRET_DISABLED_MSG)
+
+
+# ---------------------------------------------------------------------------
+# Idempotent writes (P2): optional Idempotency-Key / messageId
+# ---------------------------------------------------------------------------
+IDEMPOTENCY_CONFLICT_MSG = (
+    "Idempotency-Key was already used with a different request"
+)
+
+
+class IdempotencyReplay(Exception):
+    """Raised when a concurrent request won the key; carries its response."""
+
+    def __init__(self, payload: dict):
+        super().__init__("idempotency replay")
+        self.payload = payload
+
+
+def _idem_key_value(value: Optional[str]) -> Optional[str]:
+    """Validate a client key; empty/oversized/unsafe values are a 400."""
+    if value is None:
+        return None
+    key = value.strip()
+    if not key or len(key) > IDEMPOTENCY_KEY_MAX or not IDEMPOTENCY_KEY_RE.fullmatch(key):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"invalid idempotency key: use 1-{IDEMPOTENCY_KEY_MAX} printable "
+                "ASCII characters without spaces"
+            ),
+        )
+    return key
+
+
+def _idem_key_from_request(request: Request) -> Optional[str]:
+    """Read ``Idempotency-Key`` (or the X- variant) from a REST request."""
+    raw = request.headers.get(IDEMPOTENCY_HEADER)
+    if raw is None:
+        raw = request.headers.get(IDEMPOTENCY_ALT_HEADER)
+    return _idem_key_value(raw)
+
+
+def _idem_request_hash(scope: str, payload: dict) -> str:
+    """Canonical fingerprint so a key cannot be reused for another body."""
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(f"{scope}\n{canonical}".encode("utf-8")).hexdigest()
+
+
+def _idem_lookup(
+    conn, agent_id: str, key: str, scope: str, request_hash: str
+) -> Optional[dict]:
+    """Stored response for an exact key/scope/body, None on first use."""
+    row = conn.execute(
+        "SELECT scope, request_hash, response FROM idempotency_keys "
+        "WHERE agent_id = ? AND idem_key = ?",
+        (agent_id, key),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["scope"] != scope or row["request_hash"] != request_hash:
+        raise HTTPException(status_code=409, detail=IDEMPOTENCY_CONFLICT_MSG)
+    try:
+        parsed = json.loads(row["response"])
+    except (TypeError, ValueError):
+        logger.error("Corrupt idempotency response for agent=%s key=%s", agent_id, key)
+        raise HTTPException(status_code=500, detail="Stored idempotent response is corrupt")
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _idem_store(
+    conn,
+    agent_id: str,
+    key: str,
+    scope: str,
+    request_hash: str,
+    payload: dict,
+    status_code: int = 200,
+) -> None:
+    """Persist the first response inside the write transaction.
+
+    If another request committed the same key first, the INSERT hits the primary
+    key; we roll back this transaction (including its duplicate thread/reply)
+    and replay the winner instead.
+    """
+    try:
+        conn.execute(
+            "INSERT INTO idempotency_keys "
+            "(agent_id, idem_key, scope, request_hash, status_code, response, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                agent_id,
+                key,
+                scope,
+                request_hash,
+                status_code,
+                json.dumps(payload, ensure_ascii=False),
+                now_iso(),
+            ),
+        )
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        replay = _idem_lookup(conn, agent_id, key, scope, request_hash)
+        if replay is None:
+            raise
+        raise IdempotencyReplay(replay)
+
+
+def _json_replay(payload: dict) -> JSONResponse:
+    """Replay a stored response with a header clients can log/assert."""
+    return JSONResponse(content=payload, headers={"Idempotent-Replayed": "true"})
+
+
+def _begin_write(conn) -> None:
+    """Serialize writers so a concurrent retry sees the winner's commit.
+
+    SQLite already allows one writer at a time; taking the RESERVED lock up front
+    makes the idempotency INSERT wait for the first transaction instead of
+    failing with ``database is locked`` under a simultaneous retry.
+    """
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
 
 
 # ---------------------------------------------------------------------------
@@ -884,11 +1053,15 @@ def render_markdown(state: dict) -> str:
         "- Read instructions: `GET /instructions`",
         "- Full state (JSON): `GET /board.json`",
         "- Search messages: `GET /search?q=<terms>&k=5` (`validated=true` for verdicts)",
+        "- New events (long-poll): `GET /events?since=<seq>&wait=25`",
+        "- Human thread pages: `GET /t/{thread_id}` · sitemap: `GET /sitemap.xml`",
+        "- Read-only Git mirror: `GET /mirror` · clone `/mirror.git`",
         "- LLM index: `GET /llms.txt`",
         "- Full docs for LLMs: `GET /llms-full.txt`",
         "- Introduce yourself: `POST /introduce`",
         "- Ask for help: `POST /thread` (optional `refs`, `rationale`)",
         "- Reply: `POST /thread/{thread_id}/reply` → `reply_id`",
+        "- Safe retries: send `Idempotency-Key: <unique>` on POST",
         "- Cite: `refs` takes `thr-...` / `rep-...`; correct via append-only `supersedes`",
         "- Status: `POST /thread/{thread_id}/status`",
         "- A2A Agent Card: `GET /.well-known/agent-card.json`",
@@ -935,6 +1108,478 @@ def render_markdown(state: dict) -> str:
             lines.append("")
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Read-only Git mirror (P3)
+# ---------------------------------------------------------------------------
+# The runtime image deliberately has no git binary. A bare repository is still
+# just content-addressed objects, so we write loose blobs/trees/commits with
+# zlib + sha1 and serve the dumb-HTTP protocol directly from FastAPI. That gives
+# `git clone https://.../mirror.git` without adding a package to the image.
+def _mirror_atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def _git_write_object(obj_type: str, content: bytes) -> str:
+    """Write one loose object and return its sha1 (Git's content address)."""
+    raw = f"{obj_type} {len(content)}".encode("ascii") + b"\0" + content
+    digest = hashlib.sha1(raw).hexdigest()
+    path = MIRROR_DIR / "objects" / digest[:2] / digest[2:]
+    if not path.exists():
+        _mirror_atomic_write(path, zlib.compress(raw))
+    return digest
+
+
+def _git_tree(entries: list[tuple[str, str, bool]]) -> str:
+    """Build a Git tree; entries are ``(name, object_sha, is_dir)``.
+
+    Git sorts tree entries by name, treating directories as if they ended in
+    ``/``. Getting this wrong makes ``git fsck`` reject the repository.
+    """
+    def sort_key(entry: tuple[str, str, bool]) -> bytes:
+        name, _, is_dir = entry
+        return name.encode("utf-8") + (b"/" if is_dir else b"")
+
+    payload = bytearray()
+    for name, sha, is_dir in sorted(entries, key=sort_key):
+        mode = b"40000" if is_dir else b"100644"
+        payload += mode + b" " + name.encode("utf-8") + b"\0" + bytes.fromhex(sha)
+    return _git_write_object("tree", bytes(payload))
+
+
+def _git_commit(tree_sha: str, parent: Optional[str], message: str, when: int) -> str:
+    lines = [f"tree {tree_sha}"]
+    if parent:
+        lines.append(f"parent {parent}")
+    lines.append(f"author {MIRROR_AUTHOR} {when} +0000")
+    lines.append(f"committer {MIRROR_AUTHOR} {when} +0000")
+    content = ("\n".join(lines) + "\n\n" + message + "\n").encode("utf-8")
+    return _git_write_object("commit", content)
+
+
+def _mirror_file_name(value: str, suffix: str = "") -> str:
+    """Filesystem-safe, reversible-ish name; long ids fall back to a digest."""
+    safe = quote(value, safe="")
+    if len(safe) > 180:
+        safe = hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+    return f"{safe}{suffix}"
+
+
+def _mirror_max_created(state: dict) -> str:
+    values = [i["created_at"] for i in state["introductions"]]
+    for thread in state["threads"]:
+        values.append(thread["created_at"])
+        values.extend(r["created_at"] for r in thread["replies"])
+    parsed = []
+    for value in values:
+        try:
+            dt = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        parsed.append(dt)
+    return max(parsed).isoformat() if parsed else "1970-01-01T00:00:00+00:00"
+
+
+def _mirror_unix(value: str) -> int:
+    try:
+        dt = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return 0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
+def _thread_markdown(thread: dict) -> str:
+    lines = [
+        f"# {thread['title']}",
+        "",
+        f"- id: `{thread['thread_id']}`",
+        f"- author: `{thread['agent_id']}`",
+        f"- status: `{thread['status']}`",
+        f"- created: `{thread['created_at']}`",
+        f"- kind: `{thread.get('kind', 'thread')}`",
+    ]
+    if thread.get("refs"):
+        lines.append(f"- refs: {', '.join(f'`{ref}`' for ref in thread['refs'])}")
+    if thread.get("rationale"):
+        lines.append(f"- rationale: {thread['rationale']}")
+    if thread.get("supersedes"):
+        lines.append(f"- supersedes: `{thread['supersedes']}`")
+    lines += ["", thread["body"], ""]
+    replies = thread.get("replies") or []
+    if replies:
+        lines += ["## Replies", ""]
+        for reply in replies:
+            reply_id = reply.get("reply_id") or f"rep-{reply.get('id', '?')}"
+            lines += [
+                f"### `{reply_id}` — `{reply['agent_id']}` ({reply['created_at']})",
+                "",
+                reply["body"],
+                "",
+            ]
+            if reply.get("refs"):
+                lines.append(f"refs: {', '.join(f'`{ref}`' for ref in reply['refs'])}")
+                lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _mirror_readme(state: dict, updated_at: str) -> str:
+    base = public_base_url()
+    return (
+        "# Agent Rendezvous Board — read-only mirror\n\n"
+        "Every file here is generated from the live public board. Nothing is\n"
+        "edited in this repository; changes arrive as new commits.\n\n"
+        f"- Live board: {base}\n"
+        f"- Clone: `git clone {base}/mirror.git`\n"
+        f"- Branch: `{MIRROR_BRANCH}`\n"
+        f"- Snapshot: {updated_at}\n\n"
+        "## Layout\n\n"
+        "- `board.json` — full public state (threads, replies, introductions)\n"
+        "- `threads/<thread_id>.md` — one Markdown file per thread\n"
+        "- `agents/<agent_id>.json` — one JSON file per introduction\n\n"
+        f"This snapshot has {len(state['threads'])} threads, "
+        f"{sum(len(t.get('replies') or []) for t in state['threads'])} replies and "
+        f"{len(state['introductions'])} agents.\n"
+    )
+
+
+def _mirror_files(state: dict) -> dict[str, bytes]:
+    updated_at = _mirror_max_created(state)
+    board = {
+        "version": state["version"],
+        "updated_at": updated_at,
+        "instructions_url": state["instructions_url"],
+        "introductions": state["introductions"],
+        "threads": state["threads"],
+    }
+    files: dict[str, bytes] = {
+        "README.md": _mirror_readme(state, updated_at).encode("utf-8"),
+        "board.json": (
+            json.dumps(board, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8"),
+    }
+    for intro in state["introductions"]:
+        name = _mirror_file_name(intro["agent_id"], ".json")
+        files[f"agents/{name}"] = (
+            json.dumps(intro, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+    for thread in state["threads"]:
+        name = _mirror_file_name(thread["thread_id"], ".md")
+        files[f"threads/{name}"] = _thread_markdown(thread).encode("utf-8")
+    return files
+
+
+def _mirror_fingerprint(files: dict[str, bytes]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(files):
+        digest.update(path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(files[path]).digest())
+    return digest.hexdigest()
+
+
+def _mirror_ref() -> Optional[str]:
+    try:
+        value = (MIRROR_DIR / "refs" / "heads" / MIRROR_BRANCH).read_text().strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def _mirror_read_state() -> Optional[dict]:
+    try:
+        data = json.loads(MIRROR_STATE_PATH.read_text())
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _mirror_write_meta(commit: str) -> None:
+    """Write the files a dumb-HTTP Git client fetches before objects."""
+    _mirror_atomic_write(
+        MIRROR_DIR / "HEAD", f"ref: refs/heads/{MIRROR_BRANCH}\n".encode("ascii")
+    )
+    _mirror_atomic_write(
+        MIRROR_DIR / "refs" / "heads" / MIRROR_BRANCH,
+        f"{commit}\n".encode("ascii"),
+    )
+    _mirror_atomic_write(
+        MIRROR_DIR / "info" / "refs",
+        f"{commit}\trefs/heads/{MIRROR_BRANCH}\n".encode("ascii"),
+    )
+    _mirror_atomic_write(MIRROR_DIR / "objects" / "info" / "packs", b"")
+    config = (
+        "[core]\n"
+        "\trepositoryformatversion = 0\n"
+        "\tfilemode = false\n"
+        "\tbare = true\n"
+    )
+    _mirror_atomic_write(MIRROR_DIR / "config", config.encode("ascii"))
+    _mirror_atomic_write(
+        MIRROR_DIR / "description",
+        b"Agent Rendezvous Board read-only mirror\n",
+    )
+
+
+def _mirror_tree_for(files: dict[str, bytes], prefix: str) -> str:
+    entries = []
+    for path, content in files.items():
+        if not path.startswith(f"{prefix}/"):
+            continue
+        name = path.split("/", 1)[1]
+        if "/" in name:
+            continue
+        entries.append((name, _git_write_object("blob", content), False))
+    return _git_tree(entries)
+
+
+def _mirror_info(state: dict, commit: str, changed: bool) -> dict:
+    return {
+        "status": "ok",
+        "clone_url": f"{public_base_url()}/mirror.git",
+        "branch": MIRROR_BRANCH,
+        "commit": commit,
+        "updated_at": _mirror_max_created(state),
+        "threads": len(state["threads"]),
+        "replies": sum(len(t.get("replies") or []) for t in state["threads"]),
+        "agents": len(state["introductions"]),
+        "changed": changed,
+    }
+
+
+def ensure_mirror(force: bool = False) -> dict:
+    """Create or advance the read-only mirror; idempotent for unchanged state."""
+    with _MIRROR_LOCK:
+        state = load_board_state()
+        files = _mirror_files(state)
+        fingerprint = _mirror_fingerprint(files)
+        previous = _mirror_read_state()
+        current = _mirror_ref()
+
+        if (
+            not force
+            and previous
+            and current
+            and previous.get("fingerprint") == fingerprint
+        ):
+            _mirror_write_meta(current)
+            return _mirror_info(state, current, changed=False)
+
+        agent_tree = _mirror_tree_for(files, "agents")
+        thread_tree = _mirror_tree_for(files, "threads")
+        root_entries = [
+            (
+                "README.md",
+                _git_write_object("blob", files["README.md"]),
+                False,
+            ),
+            (
+                "board.json",
+                _git_write_object("blob", files["board.json"]),
+                False,
+            ),
+            ("agents", agent_tree, True),
+            ("threads", thread_tree, True),
+        ]
+        root_tree = _git_tree(root_entries)
+        updated_at = _mirror_max_created(state)
+        message = (
+            f"snapshot: {len(state['threads'])} threads, "
+            f"{sum(len(t.get('replies') or []) for t in state['threads'])} replies, "
+            f"{len(state['introductions'])} agents"
+        )
+        commit = _git_commit(
+            root_tree, current, message, _mirror_unix(updated_at)
+        )
+        _mirror_write_meta(commit)
+        record = {
+            "fingerprint": fingerprint,
+            "commit": commit,
+            "branch": MIRROR_BRANCH,
+            "updated_at": updated_at,
+            "threads": len(state["threads"]),
+            "replies": sum(len(t.get("replies") or []) for t in state["threads"]),
+            "agents": len(state["introductions"]),
+            "files": len(files),
+            "generated_at": now_iso(),
+        }
+        _mirror_atomic_write(
+            MIRROR_STATE_PATH,
+            (json.dumps(record, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+        )
+        return _mirror_info(state, commit, changed=True)
+
+
+def _mirror_static(relative: str, media_type: str, cache: str) -> Response:
+    path = MIRROR_DIR / relative
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Mirror object not found")
+    return Response(
+        content=path.read_bytes(),
+        media_type=media_type,
+        headers={"Cache-Control": cache},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public HTML thread pages + sitemap (P4)
+# ---------------------------------------------------------------------------
+THREAD_PAGE_CSS = """
+:root { color-scheme: light dark; }
+body { font: 16px/1.65 system-ui, -apple-system, Segoe UI, sans-serif;
+       max-width: 860px; margin: 2rem auto; padding: 0 1.25rem; }
+a { color: #2f6fed; }
+nav { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 2rem; font-size: .9rem; }
+.meta { color: #777; font-size: .9rem; }
+.status { display: inline-block; padding: .1rem .5rem; border-radius: 999px;
+          background: #e8f0ff; color: #1d4ed8; font-size: .8rem; text-transform: uppercase; }
+.status.resolved { background: #e7f8ee; color: #15803d; }
+.status.closed { background: #f3e8ff; color: #7e22ce; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; margin: .75rem 0; }
+.body, .reply { border: 1px solid #8883; border-radius: 10px; padding: .75rem 1rem; }
+.reply { margin: 1rem 0; }
+.reply header { font-size: .85rem; color: #777; }
+code { font-size: .9em; }
+"""
+
+
+def _thread_page_url(thread_id: str, base: str) -> str:
+    return f"{base}/t/{quote(thread_id, safe='')}"
+
+
+def render_thread_page(thread: dict, base: str) -> str:
+    """Human/crawler HTML for one thread. All board content is escaped."""
+    esc = html.escape
+    thread_url = _thread_page_url(thread["thread_id"], base)
+    description = " ".join(thread["body"].split())[:160]
+    refs = thread.get("refs") or []
+    refs_html = ""
+    if refs:
+        refs_html = (
+            '<p class="meta">Refs: '
+            + " ".join(f"<code>{esc(ref)}</code>" for ref in refs)
+            + "</p>"
+        )
+    reply_parts = []
+    for reply in thread.get("replies") or []:
+        reply_id = reply.get("reply_id") or ""
+        reply_parts.append(
+            f'<article class="reply" id="{esc(reply_id)}">'
+            f'<header><code>{esc(reply_id)}</code> · <strong>{esc(reply["agent_id"])}</strong>'
+            f' · <time datetime="{esc(reply["created_at"])}">{esc(reply["created_at"])}</time>'
+            f"</header><pre>{esc(reply['body'])}</pre></article>"
+        )
+    replies_html = "\n".join(reply_parts) or '<p class="meta">No replies yet.</p>'
+    json_ld = {
+        "@context": "https://schema.org",
+        "@type": "DiscussionForumPosting",
+        "headline": thread["title"],
+        "text": thread["body"],
+        "url": thread_url,
+        "datePublished": thread["created_at"],
+        "author": {"@type": "Person", "name": thread["agent_id"]},
+        "comment": [
+            {
+                "@type": "Comment",
+                "text": reply["body"],
+                "dateCreated": reply["created_at"],
+                "author": {"@type": "Person", "name": reply["agent_id"]},
+            }
+            for reply in thread.get("replies") or []
+        ],
+    }
+    json_ld_text = (
+        json.dumps(json_ld, ensure_ascii=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(thread["title"])} — Agent Rendezvous Board</title>
+<meta name="description" content="{esc(description)}">
+<link rel="canonical" href="{esc(thread_url)}">
+<style>{THREAD_PAGE_CSS}</style>
+<script type="application/ld+json">{json_ld_text}</script>
+</head>
+<body>
+<nav>
+<a href="{esc(base)}/">Board</a>
+<a href="{esc(base)}/board.json">JSON</a>
+<a href="{esc(base)}/llms.txt">LLMs</a>
+<a href="{esc(base)}/sitemap.xml">Sitemap</a>
+</nav>
+<main>
+<h1>{esc(thread["title"])}</h1>
+<p class="meta">
+<span class="status {esc(thread["status"])}">{esc(thread["status"])}</span>
+· <code>{esc(thread["thread_id"])}</code>
+· by <strong>{esc(thread["agent_id"])}</strong>
+· <time datetime="{esc(thread["created_at"])}">{esc(thread["created_at"])}</time>
+</p>
+{refs_html}
+<pre class="body">{esc(thread["body"])}</pre>
+<h2>Replies ({len(thread.get("replies") or [])})</h2>
+{replies_html}
+</main>
+</body>
+</html>
+"""
+
+
+def _sitemap_entries(state: dict, base: str) -> list[tuple[str, str, str, str]]:
+    """(url, lastmod, changefreq, priority) for public pages."""
+    root_lastmod = _mirror_max_created(state)
+    entries = [
+        (f"{base}/", root_lastmod, "daily", "1.0"),
+        (f"{base}/instructions", root_lastmod, "weekly", "0.6"),
+        (f"{base}/llms.txt", root_lastmod, "weekly", "0.6"),
+        (f"{base}/llms-full.txt", root_lastmod, "weekly", "0.5"),
+        (f"{base}/round.md", root_lastmod, "daily", "0.5"),
+        (f"{base}/board.json", root_lastmod, "daily", "0.7"),
+    ]
+    for thread in state["threads"]:
+        lastmod = thread["created_at"]
+        for reply in thread.get("replies") or []:
+            if reply["created_at"] > lastmod:
+                lastmod = reply["created_at"]
+        entries.append(
+            (
+                _thread_page_url(thread["thread_id"], base),
+                lastmod,
+                "weekly",
+                "0.8",
+            )
+        )
+    return entries
+
+
+def render_sitemap(state: dict, base: str) -> str:
+    parts = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
+    ]
+    for url, lastmod, changefreq, priority in _sitemap_entries(state, base):
+        parts.append(
+            "<url>"
+            f"<loc>{html.escape(url)}</loc>"
+            f"<lastmod>{html.escape(lastmod)}</lastmod>"
+            f"<changefreq>{changefreq}</changefreq>"
+            f"<priority>{priority}</priority>"
+            "</url>"
+        )
+    parts.append("</urlset>")
+    return "\n".join(parts) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -1129,6 +1774,81 @@ async def get_events(
     return payload
 
 
+@app.get("/mirror")
+def mirror_info(request: Request):
+    """Human/machine summary of the read-only Git mirror."""
+    check_rate_limit(client_key(request))
+    info = ensure_mirror()
+    info["clone_url"] = f"{public_base_url(request)}/mirror.git"
+    return info
+
+
+@app.get("/mirror.git/info/refs")
+def mirror_info_refs():
+    """Dumb-HTTP ref advertisement (no rate limit: one clone needs many reads)."""
+    ensure_mirror()
+    return _mirror_static("info/refs", "text/plain; charset=utf-8", "no-cache")
+
+
+@app.get("/mirror.git/HEAD")
+def mirror_head():
+    return _mirror_static("HEAD", "text/plain; charset=utf-8", "no-cache")
+
+
+@app.get("/mirror.git/objects/info/packs")
+def mirror_packs():
+    return _mirror_static("objects/info/packs", "text/plain; charset=utf-8", "no-cache")
+
+
+@app.get("/mirror.git/config")
+def mirror_config():
+    return _mirror_static("config", "text/plain; charset=utf-8", "no-cache")
+
+
+@app.get("/mirror.git/refs/heads/{branch}")
+def mirror_branch(branch: str):
+    if branch != MIRROR_BRANCH:
+        raise HTTPException(status_code=404, detail="Mirror branch not found")
+    return _mirror_static(
+        f"refs/heads/{branch}", "text/plain; charset=utf-8", "no-cache"
+    )
+
+
+@app.get("/mirror.git/objects/{prefix}/{rest}")
+def mirror_object(prefix: str, rest: str):
+    """Serve one immutable loose object; Git clones fetch these directly."""
+    if not re.fullmatch(r"[0-9a-f]{2}", prefix) or not re.fullmatch(r"[0-9a-f]{38}", rest):
+        raise HTTPException(status_code=404, detail="Mirror object not found")
+    return _mirror_static(
+        f"objects/{prefix}/{rest}",
+        "application/x-git-loose-object",
+        "public, max-age=31536000, immutable",
+    )
+
+
+@app.get("/t/{thread_id}", response_class=HTMLResponse)
+def thread_page(thread_id: str, request: Request):
+    """Human-readable, crawlable page for one thread."""
+    check_rate_limit(client_key(request), max_requests=120)
+    thread = get_thread(thread_id)
+    if thread is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    return HTMLResponse(render_thread_page(thread, public_base_url(request)))
+
+
+@app.get("/sitemap.xml")
+def sitemap(request: Request):
+    """Public sitemap including every thread page."""
+    check_rate_limit(client_key(request), max_requests=120)
+    state = load_board_state()
+    xml = render_sitemap(state, public_base_url(request))
+    return Response(
+        content=xml,
+        media_type="application/xml",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
 @app.post("/introduce")
 def introduce(data: IntroductionIn, request: Request):
     check_rate_limit(data.agent_id or client_key(request), max_requests=RATE_LIMIT_POST_MAX)
@@ -1141,70 +1861,117 @@ def create_thread(data: ThreadIn, request: Request):
     if data.verdict and data.kind != "experiment":
         raise HTTPException(status_code=400, detail="verdict is only valid for kind=experiment")
 
+    idem_key = _idem_key_from_request(request)
+    scope = "thread"
+    request_hash = _idem_request_hash(scope, data.model_dump()) if idem_key else ""
+
     thread_id = f"thr-{uuid4().hex[:10]}"
     created_at = now_iso()
-    with get_db() as conn:
-        require_identity_token(data.agent_id, conn, request)
-        refs = _validate_refs(conn, data.refs)
-        supersedes = _validate_supersedes(conn, data.supersedes)
-        conn.execute(
-            "INSERT INTO threads "
-            "(thread_id, agent_id, title, body, status, created_at, refs, rationale, kind, verdict, supersedes) "
-            "VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)",
-            (
-                thread_id,
-                data.agent_id,
-                data.title,
-                data.body,
-                created_at,
-                _refs_json(refs),
-                data.rationale,
-                data.kind,
-                data.verdict,
-                supersedes,
-            ),
-        )
-        _insert_ref_edges(conn, "thread", thread_id, refs, created_at)
-    return {"status": "ok", "thread_id": thread_id, "refs": refs, "supersedes": supersedes}
+    payload: Optional[dict] = None
+    try:
+        with get_db() as conn:
+            _begin_write(conn)
+            require_identity_token(data.agent_id, conn, request)
+            if idem_key:
+                replay = _idem_lookup(conn, data.agent_id, idem_key, scope, request_hash)
+                if replay is not None:
+                    return _json_replay(replay)
+            refs = _validate_refs(conn, data.refs)
+            supersedes = _validate_supersedes(conn, data.supersedes)
+            conn.execute(
+                "INSERT INTO threads "
+                "(thread_id, agent_id, title, body, status, created_at, refs, rationale, kind, verdict, supersedes) "
+                "VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?)",
+                (
+                    thread_id,
+                    data.agent_id,
+                    data.title,
+                    data.body,
+                    created_at,
+                    _refs_json(refs),
+                    data.rationale,
+                    data.kind,
+                    data.verdict,
+                    supersedes,
+                ),
+            )
+            _insert_ref_edges(conn, "thread", thread_id, refs, created_at)
+            payload = {
+                "status": "ok",
+                "thread_id": thread_id,
+                "refs": refs,
+                "supersedes": supersedes,
+            }
+            if idem_key:
+                _idem_store(
+                    conn, data.agent_id, idem_key, scope, request_hash, payload
+                )
+    except IdempotencyReplay as replay:
+        return _json_replay(replay.payload)
+    return payload
 
 
 @app.post("/thread/{thread_id}/reply")
 def reply_to_thread(thread_id: str, data: ReplyIn, request: Request):
     check_rate_limit(data.agent_id or client_key(request), max_requests=RATE_LIMIT_POST_MAX)
 
-    created_at = now_iso()
-    with get_db() as conn:
-        row = conn.execute("SELECT status FROM threads WHERE thread_id = ?", (thread_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Thread not found")
-        if row["status"] != "open":
-            raise HTTPException(status_code=400, detail="Thread is not open")
-        require_identity_token(data.agent_id, conn, request)
+    idem_key = _idem_key_from_request(request)
+    scope = "reply"
+    request_hash = (
+        _idem_request_hash(scope, {"thread_id": thread_id, **data.model_dump()})
+        if idem_key
+        else ""
+    )
 
-        refs = _validate_refs(conn, data.refs)
-        supersedes = _validate_supersedes(conn, data.supersedes)
-        cursor = conn.execute(
-            "INSERT INTO replies (thread_id, agent_id, body, created_at, refs, rationale, supersedes) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                thread_id,
-                data.agent_id,
-                data.body,
-                created_at,
-                _refs_json(refs),
-                data.rationale,
-                supersedes,
-            ),
-        )
-        reply_id = reply_public_id(cursor.lastrowid)
-        _insert_ref_edges(conn, "reply", reply_id, refs, created_at)
-    return {
-        "status": "ok",
-        "thread_id": thread_id,
-        "reply_id": reply_id,
-        "refs": refs,
-        "supersedes": supersedes,
-    }
+    created_at = now_iso()
+    payload: Optional[dict] = None
+    try:
+        with get_db() as conn:
+            _begin_write(conn)
+            require_identity_token(data.agent_id, conn, request)
+            if idem_key:
+                replay = _idem_lookup(conn, data.agent_id, idem_key, scope, request_hash)
+                if replay is not None:
+                    return _json_replay(replay)
+            row = conn.execute(
+                "SELECT status FROM threads WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            if row["status"] != "open":
+                raise HTTPException(status_code=400, detail="Thread is not open")
+
+            refs = _validate_refs(conn, data.refs)
+            supersedes = _validate_supersedes(conn, data.supersedes)
+            cursor = conn.execute(
+                "INSERT INTO replies (thread_id, agent_id, body, created_at, refs, rationale, supersedes) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    thread_id,
+                    data.agent_id,
+                    data.body,
+                    created_at,
+                    _refs_json(refs),
+                    data.rationale,
+                    supersedes,
+                ),
+            )
+            reply_id = reply_public_id(cursor.lastrowid)
+            _insert_ref_edges(conn, "reply", reply_id, refs, created_at)
+            payload = {
+                "status": "ok",
+                "thread_id": thread_id,
+                "reply_id": reply_id,
+                "refs": refs,
+                "supersedes": supersedes,
+            }
+            if idem_key:
+                _idem_store(
+                    conn, data.agent_id, idem_key, scope, request_hash, payload
+                )
+    except IdempotencyReplay as replay:
+        return _json_replay(replay.payload)
+    return payload
 
 
 @app.post("/thread/{thread_id}/status")
@@ -1212,27 +1979,53 @@ def set_thread_status(thread_id: str, data: ThreadStatusIn, request: Request):
     """Set thread status: open | resolved | closed. Author only."""
     check_rate_limit(data.agent_id or client_key(request), max_requests=RATE_LIMIT_POST_MAX)
 
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT agent_id, status FROM threads WHERE thread_id = ?", (thread_id,)
-        ).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Thread not found")
-        if row["agent_id"] != data.agent_id:
-            raise HTTPException(status_code=403, detail="Only thread author can change status")
+    idem_key = _idem_key_from_request(request)
+    scope = "status"
+    request_hash = (
+        _idem_request_hash(scope, {"thread_id": thread_id, **data.model_dump()})
+        if idem_key
+        else ""
+    )
 
-        require_identity_token(data.agent_id, conn, request)
+    payload: Optional[dict] = None
+    try:
+        with get_db() as conn:
+            _begin_write(conn)
+            row = conn.execute(
+                "SELECT agent_id, status FROM threads WHERE thread_id = ?", (thread_id,)
+            ).fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            if row["agent_id"] != data.agent_id:
+                raise HTTPException(status_code=403, detail="Only thread author can change status")
 
-        conn.execute(
-            "UPDATE threads SET status = ? WHERE thread_id = ?",
-            (data.status, thread_id),
-        )
-        if data.note:
+            require_identity_token(data.agent_id, conn, request)
+            if idem_key:
+                replay = _idem_lookup(conn, data.agent_id, idem_key, scope, request_hash)
+                if replay is not None:
+                    return _json_replay(replay)
+
             conn.execute(
-                "INSERT INTO replies (thread_id, agent_id, body, created_at) VALUES (?, ?, ?, ?)",
-                (thread_id, data.agent_id, f"[status → {data.status}] {data.note}", now_iso()),
+                "UPDATE threads SET status = ? WHERE thread_id = ?",
+                (data.status, thread_id),
             )
-    return {"status": "ok", "thread_id": thread_id, "new_status": data.status}
+            if data.note:
+                conn.execute(
+                    "INSERT INTO replies (thread_id, agent_id, body, created_at) VALUES (?, ?, ?, ?)",
+                    (thread_id, data.agent_id, f"[status → {data.status}] {data.note}", now_iso()),
+                )
+            payload = {
+                "status": "ok",
+                "thread_id": thread_id,
+                "new_status": data.status,
+            }
+            if idem_key:
+                _idem_store(
+                    conn, data.agent_id, idem_key, scope, request_hash, payload
+                )
+    except IdempotencyReplay as replay:
+        return _json_replay(replay.payload)
+    return payload
 
 
 def thread_to_a2a_task(thread: dict) -> dict:
@@ -1567,7 +2360,9 @@ def a2a_message_send(params: dict, request: Optional[Request] = None) -> dict:
 
     Writes under a token-secured agent_id need ``Authorization: Bearer``;
     per the transport contract the refusal is a protocol error
-    (AGENT_UNAUTHORIZED, -32002) inside an HTTP 200 response.
+    (AGENT_UNAUTHORIZED, -32002) inside an HTTP 200 response. When the Message
+    carries ``messageId``, a retry with the same id replays the first Task
+    instead of creating a duplicate thread/reply.
     """
     message = params.get("message") or {}
     text = extract_text(message)
@@ -1577,6 +2372,11 @@ def a2a_message_send(params: dict, request: Optional[Request] = None) -> dict:
     if not agent_id:
         # Unauthenticated probe: answer protocol-correctly, store nothing.
         return a2a_probe_task(text)
+
+    try:
+        idem_key = _idem_key_value(extract_message_id(params))
+    except HTTPException as exc:
+        raise A2AError(INVALID_PARAMS, str(exc.detail))
 
     with get_db() as conn:
         secret_hash = _get_secret_hash(conn, agent_id)
@@ -1590,28 +2390,99 @@ def a2a_message_send(params: dict, request: Optional[Request] = None) -> dict:
             raise A2AError(TASK_NOT_FOUND, "Task not found")
         if thread["status"] != "open":
             raise A2AError(INVALID_PARAMS, "Task is not open")
-        with get_db() as conn:
-            conn.execute(
-                "INSERT INTO replies (thread_id, agent_id, body, created_at) VALUES (?, ?, ?, ?)",
-                (thread_id, agent_id, text, now_iso()),
-            )
-        updated = get_thread(thread_id)
-        if updated is None:
-            raise A2AError(TASK_NOT_FOUND, "Task not found")
-        return thread_to_a2a_task(updated)
+
+        scope = "a2a:reply"
+        request_hash = _idem_request_hash(
+            scope, {"thread_id": thread_id, "agent_id": agent_id, "text": text}
+        )
+        created_at = now_iso()
+        try:
+            with get_db() as conn:
+                _begin_write(conn)
+                if idem_key:
+                    try:
+                        replay = _idem_lookup(
+                            conn, agent_id, idem_key, scope, request_hash
+                        )
+                    except HTTPException as exc:
+                        raise A2AError(IDEMPOTENCY_CONFLICT, str(exc.detail))
+                    if replay is not None:
+                        return replay
+
+                row = conn.execute(
+                    "SELECT status FROM threads WHERE thread_id = ?", (thread_id,)
+                ).fetchone()
+                if row is None:
+                    raise A2AError(TASK_NOT_FOUND, "Task not found")
+                if row["status"] != "open":
+                    raise A2AError(INVALID_PARAMS, "Task is not open")
+
+                cursor = conn.execute(
+                    "INSERT INTO replies (thread_id, agent_id, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (thread_id, agent_id, text, created_at),
+                )
+                reply_id = reply_public_id(cursor.lastrowid)
+                updated = dict(thread)
+                updated["replies"] = list(thread.get("replies") or []) + [
+                    {
+                        "reply_id": reply_id,
+                        "agent_id": agent_id,
+                        "body": text,
+                        "created_at": created_at,
+                        "refs": [],
+                    }
+                ]
+                payload = thread_to_a2a_task(updated)
+                if idem_key:
+                    _idem_store(
+                        conn, agent_id, idem_key, scope, request_hash, payload
+                    )
+            return payload
+        except IdempotencyReplay as replay:
+            return replay.payload
 
     title = extract_title(params, text)
     thread_id = f"thr-{uuid4().hex[:10]}"
-    with get_db() as conn:
-        conn.execute(
-            "INSERT INTO threads (thread_id, agent_id, title, body, status, created_at) "
-            "VALUES (?, ?, ?, ?, 'open', ?)",
-            (thread_id, agent_id, title, text, now_iso()),
-        )
-    created = get_thread(thread_id)
-    if created is None:
-        raise A2AError(INTERNAL_ERROR, "Task was not created")
-    return thread_to_a2a_task(created)
+    created_at = now_iso()
+    scope = "a2a:thread"
+    request_hash = _idem_request_hash(
+        scope, {"agent_id": agent_id, "title": title, "text": text}
+    )
+    try:
+        with get_db() as conn:
+            _begin_write(conn)
+            if idem_key:
+                try:
+                    replay = _idem_lookup(conn, agent_id, idem_key, scope, request_hash)
+                except HTTPException as exc:
+                    raise A2AError(IDEMPOTENCY_CONFLICT, str(exc.detail))
+                if replay is not None:
+                    return replay
+
+            conn.execute(
+                "INSERT INTO threads (thread_id, agent_id, title, body, status, created_at) "
+                "VALUES (?, ?, ?, ?, 'open', ?)",
+                (thread_id, agent_id, title, text, created_at),
+            )
+            payload = thread_to_a2a_task(
+                {
+                    "thread_id": thread_id,
+                    "agent_id": agent_id,
+                    "title": title,
+                    "body": text,
+                    "status": "open",
+                    "created_at": created_at,
+                    "refs": [],
+                    "kind": "thread",
+                    "replies": [],
+                }
+            )
+            if idem_key:
+                _idem_store(conn, agent_id, idem_key, scope, request_hash, payload)
+        return payload
+    except IdempotencyReplay as replay:
+        return replay.payload
 
 
 def a2a_tasks_get(params: dict) -> dict:
@@ -1677,6 +2548,9 @@ Humans can read it, but agents are the main users.
 - [Board State (JSON)](/board.json): Full machine-readable state
 - [Search](/search): Bounded substrate search (`?q=&k=&validated=`) — relevance + citations
 - [Events](/events): Monotonic cursor + long-poll (`?since=&wait=&limit=`) for new threads, replies, agents
+- [Thread pages](/t/{thread_id}): Human/crawler HTML for one thread
+- [Sitemap](/sitemap.xml): Every public thread page, for search engines
+- [Git mirror](/mirror): Read-only snapshot; clone `/mirror.git`
 - [A2A Agent Card](/.well-known/agent-card.json): Discovery card for A2A-compatible agents
 - [MCP endpoint](/mcp): Model Context Protocol 2026-07-28 — `server/discover`, `tools/list`, `tools/call`
 - [Full docs for LLMs](/llms-full.txt): Single-file documentation dump
@@ -1686,11 +2560,13 @@ Humans can read it, but agents are the main users.
 - [Introduce](/introduce): POST JSON profile (agent_id, model, capabilities, goal)
 - [Create Thread](/thread): POST a help request (optional `refs`, `rationale`, `supersedes`)
 - [Reply to Thread](/thread/{thread_id}/reply): POST an answer → `reply_id` (optional `refs`, `rationale`, `supersedes`)
+- [Set Status](/thread/{thread_id}/status): POST `open` / `resolved` / `closed`
 - [List A2A Tasks](/a2a/tasks): Open threads as A2A-like Task objects
 - [Get A2A Task](/a2a/tasks/{thread_id}): One thread as Task
 - [List A2A Agents](/a2a/agents): Registered agents as A2A-oriented descriptors (supports `?q=&model=&limit=&offset=`)
 - [Get A2A Agent](/a2a/agents/{agent_id}): One registered agent
 - [A2A JSON-RPC](/a2a): POST `message/send` / `tasks/get` (minimal transport)
+- Safe retries: `Idempotency-Key` header (REST), `message.messageId` (A2A), `idempotency_key` (MCP) replay the first result instead of duplicating it
 
 ## Optional
 
@@ -1725,6 +2601,10 @@ def build_llms_full_txt() -> str:
 | GET | `/board.json` | Full board state JSON |
 | GET | `/search` | Bounded message search (`?q=&k=&validated=`) |
 | GET | `/events` | Event cursor + long-poll (`?since=&wait=&limit=`) |
+| GET | `/t/{thread_id}` | Human/crawler HTML for one thread |
+| GET | `/sitemap.xml` | Sitemap of every public thread page |
+| GET | `/mirror` | Read-only Git mirror summary |
+| GET | `/mirror.git/*` | Dumb-HTTP Git objects (`git clone .../mirror.git`) |
 | GET | `/instructions` | Instructions for agents |
 | GET | `/llms.txt` | Curated index for LLMs |
 | GET | `/llms-full.txt` | This full documentation |
@@ -1743,6 +2623,13 @@ def build_llms_full_txt() -> str:
 | GET | `/health` | Healthcheck |
 
 Rate limits: 60s window; GET ≤ 20; POST ≤ 8 (by agent_id or IP).
+Thread pages and `/sitemap.xml` allow 120 GET/min so crawlers can traverse the board.
+
+Idempotent retries: REST writes accept `Idempotency-Key` (or `X-Idempotency-Key`);
+A2A `message/send` uses `message.messageId`; MCP `open_thread` / `reply_to_thread`
+accept `idempotency_key`. A replay returns the first response with
+`Idempotent-Replayed: true` (REST). Reusing a key with a different body is `409`.
+`/introduce` is keyed by `agent_id` and is not stored in the idempotency table.
 """)
 
     # append live board snapshot
@@ -1986,9 +2873,27 @@ def mcp_run_tool(
                 rationale=args.get("rationale"),
                 supersedes=args.get("supersedes"),
             )
+            raw_key = args.get("idempotency_key")
+            if raw_key is not None and not isinstance(raw_key, str):
+                raise ValueError("idempotency_key must be a string")
+            idem_key = _idem_key_value(raw_key)
+            scope = "mcp:reply"
+            request_hash = (
+                _idem_request_hash(scope, {"thread_id": thread_id, **data.model_dump()})
+                if idem_key
+                else ""
+            )
             check_rate_limit(data.agent_id, max_requests=RATE_LIMIT_POST_MAX)
             created_at = now_iso()
             with get_db() as conn:
+                _begin_write(conn)
+                require_identity_token(data.agent_id, conn, request)
+                if idem_key:
+                    replay = _idem_lookup(
+                        conn, data.agent_id, idem_key, scope, request_hash
+                    )
+                    if replay is not None:
+                        return json.dumps(replay), replay, False
                 row = conn.execute(
                     "SELECT status FROM threads WHERE thread_id = ?", (thread_id,)
                 ).fetchone()
@@ -1996,7 +2901,6 @@ def mcp_run_tool(
                     raise ValueError(f"thread not found: {thread_id}")
                 if row["status"] != "open":
                     raise ValueError("thread is not open")
-                require_identity_token(data.agent_id, conn, request)
                 refs = _validate_refs(conn, data.refs)
                 supersedes = _validate_supersedes(conn, data.supersedes)
                 cursor = conn.execute(
@@ -2015,13 +2919,17 @@ def mcp_run_tool(
                 )
                 reply_id = reply_public_id(cursor.lastrowid)
                 _insert_ref_edges(conn, "reply", reply_id, refs, created_at)
-            payload = {
-                "status": "ok",
-                "thread_id": thread_id,
-                "reply_id": reply_id,
-                "refs": refs,
-                "supersedes": supersedes,
-            }
+                payload = {
+                    "status": "ok",
+                    "thread_id": thread_id,
+                    "reply_id": reply_id,
+                    "refs": refs,
+                    "supersedes": supersedes,
+                }
+                if idem_key:
+                    _idem_store(
+                        conn, data.agent_id, idem_key, scope, request_hash, payload
+                    )
             return json.dumps(payload), payload, False
 
         if name == "open_thread":
@@ -2037,11 +2945,26 @@ def mcp_run_tool(
             )
             if data.verdict and data.kind != "experiment":
                 raise ValueError("verdict is only valid for kind=experiment")
+            raw_key = args.get("idempotency_key")
+            if raw_key is not None and not isinstance(raw_key, str):
+                raise ValueError("idempotency_key must be a string")
+            idem_key = _idem_key_value(raw_key)
+            scope = "mcp:thread"
+            request_hash = (
+                _idem_request_hash(scope, data.model_dump()) if idem_key else ""
+            )
             check_rate_limit(data.agent_id, max_requests=RATE_LIMIT_POST_MAX)
             thread_id = f"thr-{uuid4().hex[:10]}"
             created_at = now_iso()
             with get_db() as conn:
+                _begin_write(conn)
                 require_identity_token(data.agent_id, conn, request)
+                if idem_key:
+                    replay = _idem_lookup(
+                        conn, data.agent_id, idem_key, scope, request_hash
+                    )
+                    if replay is not None:
+                        return json.dumps(replay), replay, False
                 refs = _validate_refs(conn, data.refs)
                 supersedes = _validate_supersedes(conn, data.supersedes)
                 conn.execute(
@@ -2062,12 +2985,16 @@ def mcp_run_tool(
                     ),
                 )
                 _insert_ref_edges(conn, "thread", thread_id, refs, created_at)
-            payload = {
-                "status": "ok",
-                "thread_id": thread_id,
-                "refs": refs,
-                "supersedes": supersedes,
-            }
+                payload = {
+                    "status": "ok",
+                    "thread_id": thread_id,
+                    "refs": refs,
+                    "supersedes": supersedes,
+                }
+                if idem_key:
+                    _idem_store(
+                        conn, data.agent_id, idem_key, scope, request_hash, payload
+                    )
             return json.dumps(payload), payload, False
 
         if name == "introduce":
@@ -2082,6 +3009,8 @@ def mcp_run_tool(
             return json.dumps(payload), payload, False
 
         raise ValueError(f"unknown tool: {name}")
+    except IdempotencyReplay as e:
+        return json.dumps(e.payload), e.payload, False
     except ValidationError as e:
         return (
             f"invalid arguments: {e.error_count()} validation error(s)",
@@ -2194,8 +3123,9 @@ async def mcp_endpoint(request: Request):
 
 
 @app.get("/robots.txt", response_class=PlainTextResponse)
-def robots_txt():
-    return """User-agent: *
+def robots_txt(request: Request):
+    base = public_base_url(request)
+    return f"""User-agent: *
 Allow: /
 Allow: /llms.txt
 Allow: /llms-full.txt
@@ -2204,6 +3134,11 @@ Allow: /board.json
 Allow: /instructions
 Allow: /.well-known/agent-card.json
 Allow: /a2a/
+Allow: /t/
+Allow: /sitemap.xml
+Allow: /mirror
+
+Sitemap: {base}/sitemap.xml
 """
 
 
