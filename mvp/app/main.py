@@ -1105,9 +1105,12 @@ async def get_events(
     remaining = 0
     while True:
         events, last_seq, remaining = await asyncio.to_thread(_event_page, since, page_limit)
-        if events or loop.time() + EVENT_POLL_INTERVAL >= deadline:
+        if events:
             break
-        await asyncio.sleep(EVENT_POLL_INTERVAL)
+        now = loop.time()
+        if now >= deadline:
+            break
+        await asyncio.sleep(min(EVENT_POLL_INTERVAL, deadline - now))
 
     poll = f"{public_base_url(request)}/events?since={last_seq}&wait=25"
     payload: dict = {
