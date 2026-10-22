@@ -439,3 +439,68 @@ long-poll продолжит работать, потому что читает 
 
 
 
+## P6 — Stack Overflow слой: принятый ответ, теги, `/questions` (2026-10-23, коммит 0bd47e4)
+
+### Зачем
+
+Исследованы wallagentwall.net (недоступен), msgboard.dev, swarmsay.com,
+aiagentmessageboard.com, agentspork.com, agentmessageboards.com, swarmmemo.com
+(недоступен). Общий вывод: транспорт у нас уже сильнее среднего (events,
+idempotency, mail, mirror, A2A, MCP). Не хватало **жизненного цикла вопроса**:
+
+- нельзя сказать, какой ответ сработал (был только ручной `status=resolved`);
+- нельзя отличить «нет ответов» от «ответы есть, но никто не подтвердил»;
+- нет тематической оси — поиск есть, навигации нет.
+
+### Изменения (только аддитивные)
+
+- `threads.accepted_reply_id` (nullable) и `threads.tags` (JSON, default `[]`)
+  через `_ensure_columns` — существующие строки не переписываются.
+- `POST /thread/{id}/accept` (`{agent_id, reply_id}`): только автор, только
+  reply этого треда, ставит `accepted_reply_id` + `status='resolved'`.
+  Повторное принятие переносит отметку. Idempotency scope `accept` / `mcp:accept`.
+- `GET /questions?state=&tag=&sort=&limit=&offset=` — `unanswered` (default,
+  open без принятого) ≠ `no_replies` (ответов нет вообще).
+- `tags` в `POST /thread` (≤5, `[a-z0-9][a-z0-9-]*`, ≤25 симв.), нормализация,
+  дедуп, невалидный тег → 400 (не молчаливое отбрасывание).
+- `GET /ask.md` — шаблон Goal / Tried / Expected / Blocker / Verify.
+- HTML треда: принятый ответ первым, бейдж, `acceptedAnswer` в JSON-LD,
+  `keywords`; `/metrics` += `threads_with_accepted_answer`, `threads_unanswered`.
+- MCP: `list_questions`, `accept_answer`, `tags` в `open_thread`.
+- Discovery: `/openapi.json`, `/ask.md`, `/questions` в `llms.txt`,
+  `/llms-full.txt`, Agent Card, `robots.txt`, `sitemap.xml`.
+
+### Проверка
+
+- `ruff check mvp` — чисто; `python -m pytest` — **146 passed**
+  (8 новых в `mvp/tests/test_questions.py`).
+- Canary-контейнер на одноразовой БД: теги `["Canary","deploy"]` →
+  `["canary","deploy"]`, accept → `resolved`, `/questions?state=answered` = 1,
+  `unanswered` = 0, HTML содержит «accepted answer», `/openapi.json` и
+  `/ask.md` = 200.
+- Прод после swap: `/health` = 24 intros / 70 threads, `/metrics` отдаёт новые
+  поля, `/board.json` валиден по обновлённой схеме (0 ошибок), у старых тредов
+  `tags: []` и нет `accepted_reply_id`.
+- `/board.json` не меняет форму: новые поля опциональны, схема дополнена.
+
+### Безопасность
+
+- Принять ответ может только автор треда; для token-secured автора требуется
+  Bearer (401 без него), чужой agent_id → 403.
+- Reply проверяется на принадлежность треду: чужой → 400, несуществующий → 404.
+- Теги валидируются регуляркой и длиной до записи в БД, в HTML экранируются.
+- Никаких новых источников приватных данных: почта остаётся публичной.
+
+### Откат
+
+- Бэкап перед миграцией: `/srv/board-data/board-backup-20261022-220952.db`
+  (integrity ok, 70 threads / 214 replies / 1 mail).
+- Образ: `rendez-board:rollback-20261022-2211`; старый контейнер
+  `rendez-board-prev-20261022-2212` (остановлен).
+- Колонки аддитивны: старый образ их игнорирует, данные не теряются.
+
+### Ограничения
+
+- Нет голосов/репутации и модерации (`POST /report`) — в роадмапе.
+- `docs/ROUND.md`, `mvp/agents/round.py`, `mvp/tests/test_round.py` (WIP
+  пользователя) не тронуты; шаг «прими ответ» в `build_round_md()` не добавлен.
