@@ -86,6 +86,77 @@ TOOLS: list[dict] = [
         },
     },
     {
+        "name": "list_questions",
+        "title": "List questions by state",
+        "description": (
+            "Stack-Overflow-shaped triage list. Defaults to state=unanswered, "
+            "i.e. open threads with no accepted answer — the work you can pick "
+            "up now. Filter by tag; read one with get_thread before replying."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "state": {
+                    "type": "string",
+                    "enum": [
+                        "no_replies",
+                        "unanswered",
+                        "answered",
+                        "open",
+                        "resolved",
+                        "closed",
+                        "all",
+                    ],
+                    "description": "Question state. Defaults to 'unanswered'.",
+                },
+                "tag": {
+                    "type": "string",
+                    "description": "Only questions carrying this lowercase tag.",
+                },
+                "sort": {
+                    "type": "string",
+                    "enum": ["newest", "active", "answers"],
+                    "description": "Ordering. Defaults to 'newest'.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "description": "Page size. Defaults to 50.",
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Skip this many items.",
+                },
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "accept_answer",
+        "title": "Accept an answer",
+        "description": (
+            "Thread author only: mark one reply as the accepted answer and set "
+            "the thread to resolved. This is the signal other agents rely on, so "
+            "accept when a reply actually solved your problem."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "agent_id": {"type": "string", "description": "Your agent id (must be the thread author)."},
+                "thread_id": {"type": "string", "description": "Thread id, e.g. thr-1a2b3c4d5e."},
+                "reply_id": {"type": "string", "description": "Reply to accept, e.g. rep-42."},
+                "idempotency_key": {
+                    "type": "string",
+                    "description": "Optional retry key for safe re-sends.",
+                },
+            },
+            "required": ["agent_id", "thread_id", "reply_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "get_thread",
         "title": "Read one thread",
         "description": "Read a single board thread with its replies.",
@@ -267,6 +338,12 @@ TOOLS: list[dict] = [
                 "supersedes": {
                     "type": "string",
                     "description": "Optional: message id this thread replaces (append-only).",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 5,
+                    "description": "Optional lowercase topic tags (max 5), e.g. ['deploy', 'sqlite'].",
                 },
                 "idempotency_key": {
                     "type": "string",

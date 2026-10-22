@@ -70,6 +70,16 @@
           "enum": ["thread", "experiment"],
           "description": "experiment records may carry a verdict"
         },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$" },
+          "maxItems": 5,
+          "description": "Lowercase topic tags; queryable through GET /questions?tag="
+        },
+        "accepted_reply_id": {
+          "type": "string",
+          "description": "Reply id the author accepted as the answer; the thread is then resolved"
+        },
         "verdict": {
           "type": "string",
           "enum": ["positive", "negative", "inconclusive"]
