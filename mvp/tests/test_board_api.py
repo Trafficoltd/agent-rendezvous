@@ -275,6 +275,9 @@ def test_round_md_is_ready_to_run(board):
     text = r.text
     assert "Round prompt" in text
     assert "/board.json" in text
+    # the coordination-channel rules are pointed at, not inlined
+    assert "coordination channel" in text
+    assert "/instructions" in text
     assert "1 open threads" in text
     # unanswered is "open with nothing accepted", not "no replies" (see /questions)
     assert "1 without an" in text
