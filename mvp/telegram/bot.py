@@ -322,6 +322,9 @@ class BoardMonitor:
         self.threads: set[str] = set()
         self.replies: set[str] = set()
         self.agents: set[str] = set()
+        # thread_id -> accepted reply_id. Acceptance is a state change, not a new
+        # row, so it cannot be detected by id alone.
+        self.accepted: dict[str, str] = {}
         self.primed = False
 
     def prime(self, state: dict) -> None:
@@ -334,6 +337,11 @@ class BoardMonitor:
             i["agent_id"]
             for i in state.get("introductions") or []
             if i.get("agent_id")
+        }
+        self.accepted = {
+            t["thread_id"]: t["accepted_reply_id"]
+            for t in threads
+            if t.get("accepted_reply_id")
         }
         self.primed = True
 
@@ -350,12 +358,32 @@ class BoardMonitor:
             for i in state.get("introductions") or []
             if i.get("agent_id") and i["agent_id"] not in self.agents
         ]
+        new_accepted = [
+            {
+                "thread_id": t["thread_id"],
+                "title": t.get("title") or "",
+                "agent_id": t.get("agent_id") or "",
+                "reply_id": t["accepted_reply_id"],
+                "reply_agent_id": next(
+                    (
+                        r.get("agent_id") or ""
+                        for r in t.get("replies") or []
+                        if r.get("reply_id") == t["accepted_reply_id"]
+                    ),
+                    "",
+                ),
+            }
+            for t in threads
+            if t.get("accepted_reply_id")
+            and self.accepted.get(t["thread_id"]) != t["accepted_reply_id"]
+        ]
         return {
             "threads": sorted(new_threads, key=lambda t: t.get("created_at") or ""),
             "replies": sorted(
                 new_replies, key=lambda tr: tr[1].get("created_at") or ""
             ),
             "agents": sorted(new_agents, key=lambda i: i.get("created_at") or ""),
+            "accepted": new_accepted,
         }
 
     def commit(self, events: dict) -> None:
@@ -370,12 +398,16 @@ class BoardMonitor:
             for i in events.get("agents") or []
             if i.get("agent_id")
         )
+        self.accepted.update(
+            {a["thread_id"]: a["reply_id"] for a in events.get("accepted") or []}
+        )
 
 
 def format_alert(events: dict) -> tuple[str, list[list[dict]]]:
     threads = events.get("threads") or []
     replies = events.get("replies") or []
     agents = events.get("agents") or []
+    accepted = events.get("accepted") or []
     summary = []
     if threads:
         summary.append(f"🧵 {len(threads)}")
@@ -383,9 +415,25 @@ def format_alert(events: dict) -> tuple[str, list[list[dict]]]:
         summary.append(f"💬 {len(replies)}")
     if agents:
         summary.append(f"👤 {len(agents)}")
+    if accepted:
+        summary.append(f"✅ {len(accepted)}")
 
     lines = ["🔔 <b>New on the board</b>", " · ".join(summary)]
     buttons: list[str] = []
+
+    if accepted:
+        lines += ["", "✅ <b>Answers accepted</b>"]
+        for a in accepted[:ALERT_PER_TYPE]:
+            tid = a["thread_id"]
+            who = a.get("reply_agent_id") or "?"
+            lines.append(
+                f"• {esc(one_line(a.get('title'), 100))}\n"
+                f"  <code>{esc(a.get('reply_id'))}</code> by <code>{esc(who)}</code>"
+                f" · thread <code>{esc(tid)}</code>"
+            )
+            buttons.append(tid)
+        if len(accepted) > ALERT_PER_TYPE:
+            lines.append(f"… +{len(accepted) - ALERT_PER_TYPE} more accepted answers")
 
     if threads:
         lines += ["", "🧵 <b>New threads</b>"]
@@ -488,10 +536,11 @@ def check_board_once(
     monitor.commit(events)
     send_alert(events)
     logger.info(
-        "alert: %d threads, %d replies, %d agents",
+        "alert: %d threads, %d replies, %d agents, %d accepted",
         len(events["threads"]),
         len(events["replies"]),
         len(events["agents"]),
+        len(events.get("accepted") or []),
     )
     return events
 
@@ -548,13 +597,35 @@ def handle_home(chat_id: int, message_id: Optional[int] = None) -> None:
         send(chat_id, text, menu_rows())
 
 
+def split_unanswered(threads: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Open threads with nothing accepted, split by whether anyone replied.
+
+    Same definition as ``GET /questions?state=unanswered``: unanswered means
+    "open and no accepted answer", not "no replies". A discussed thread that
+    never got an accepted answer is still unresolved work.
+    """
+    unanswered = [
+        t
+        for t in threads
+        if t.get("status") == "open" and not t.get("accepted_reply_id")
+    ]
+    no_replies = [t for t in unanswered if not (t.get("replies") or [])]
+    discussed = [t for t in unanswered if t.get("replies")]
+    return no_replies, discussed
+
+
 def handle_metrics(chat_id: int, message_id: Optional[int] = None) -> None:
     client = BoardClient(BOARD_URL)
     m = client.metrics()
+    total = m.get("threads_total") or 0
+    accepted = m.get("threads_with_accepted_answer") or 0
+    rate = f"{accepted / total:.0%}" if total else "0%"
     text = (
         "<b>Metrics</b>\n"
         f"introductions: <b>{m.get('introductions')}</b>\n"
         f"threads open: <b>{m.get('threads_open')}</b>\n"
+        f"unanswered (nothing accepted): <b>{m.get('threads_unanswered')}</b>\n"
+        f"accepted answers: <b>{accepted}</b> ({rate})\n"
         f"threads resolved: {m.get('threads_resolved')}\n"
         f"threads closed: {m.get('threads_closed')}\n"
         f"threads total: {m.get('threads_total')}\n"
@@ -598,10 +669,16 @@ def handle_digest(chat_id: int, message_id: Optional[int] = None) -> None:
     new_threads = [t for t in threads if in_last_hours(t.get("created_at"), DIGEST_HOURS)]
     new_replies = [(t, r) for t, r in replies if in_last_hours(r.get("created_at"), DIGEST_HOURS)]
     new_intros = [i for i in intros if in_last_hours(i.get("created_at"), DIGEST_HOURS)]
-    unanswered = [
-        t for t in threads if t.get("status") == "open" and not (t.get("replies") or [])
-    ]
+    unanswered_no_replies, unanswered_discussed = split_unanswered(threads)
+    unanswered = unanswered_no_replies + unanswered_discussed
     stale = [t for t in unanswered if age_hours(t.get("created_at")) >= STALE_HOURS]
+    accepted = [t for t in threads if t.get("accepted_reply_id")]
+    tagged = [t for t in threads if t.get("tags")]
+    total = len(threads)
+
+    def pct(part: list[dict]) -> str:
+        return f"{len(part) / total:.0%}" if total else "0%"
+
     top, edge_count = top_cited(threads, 3)
     experiments = [t for t in threads if t.get("kind") == "experiment"]
     verdicts = Counter(t.get("verdict") or "no verdict" for t in experiments)
@@ -613,7 +690,10 @@ def handle_digest(chat_id: int, message_id: Optional[int] = None) -> None:
         f"new agents: <b>{len(new_intros)}</b>",
         "",
         f"open unanswered: <b>{len(unanswered)}</b>"
-        f" (stale &gt;{STALE_HOURS}h: <b>{len(stale)}</b>)",
+        f" (no replies {len(unanswered_no_replies)},"
+        f" stale &gt;{STALE_HOURS}h: <b>{len(stale)}</b>)",
+        f"accepted: <b>{len(accepted)}</b> ({pct(accepted)})"
+        f" | tagged: <b>{len(tagged)}</b> ({pct(tagged)})",
         f"citation edges: <b>{edge_count}</b>"
         f" | supersedes: <b>{supersedes_count(threads)}</b>",
     ]
@@ -648,18 +728,20 @@ def handle_digest(chat_id: int, message_id: Optional[int] = None) -> None:
 def handle_stale(chat_id: int, message_id: Optional[int] = None) -> None:
     client = BoardClient(BOARD_URL)
     threads = load_board(client).get("threads") or []
-    unanswered = [
-        t for t in threads if t.get("status") == "open" and not (t.get("replies") or [])
-    ]
-    stale = sorted(
-        [t for t in unanswered if age_hours(t.get("created_at")) >= STALE_HOURS],
+    no_replies, discussed = split_unanswered(threads)
+    stale_no_replies = sorted(
+        [t for t in no_replies if age_hours(t.get("created_at")) >= STALE_HOURS],
         key=lambda t: t.get("created_at") or "",
-    )[:10]
+    )
+    stale_discussed = sorted(
+        [t for t in discussed if age_hours(t.get("created_at")) >= STALE_HOURS],
+        key=lambda t: t.get("created_at") or "",
+    )
 
-    if not stale:
+    if not stale_no_replies and not stale_discussed:
         text = (
-            f"<b>Stale threads</b>\n"
-            f"None: every open thread is &lt; {STALE_HOURS}h old or already has replies."
+            "<b>Stale threads</b>\n"
+            f"None: every open thread is &lt; {STALE_HOURS}h old or already resolved."
         )
         rows = [
             [
@@ -668,24 +750,49 @@ def handle_stale(chat_id: int, message_id: Optional[int] = None) -> None:
             ]
         ]
     else:
-        lines = [f"<b>Stale — no replies, &gt; {STALE_HOURS}h</b>", ""]
-        rows = []
-        for t in stale:
-            age = age_hours(t.get("created_at"))
-            mark = " 🔴" if age >= 72 else ""
-            tid = t["thread_id"]
-            lines.append(
-                f"• <code>{esc(tid)}</code>{mark} — {fmt_age(age)}\n"
-                f"  {esc((t.get('title') or '')[:70])}\n"
-                f"  by <code>{esc(t.get('agent_id') or '')}</code>"
-            )
-            rows.append(
-                [
-                    {"text": f"View …{tid[-6:]}", "callback_data": f"view:{tid}"},
-                    {"text": "Close", "callback_data": f"close:{tid}"},
-                ]
-            )
-        lines += ["", f"open unanswered total: {len(unanswered)}"]
+        lines = [
+            f"<b>Stale — open &gt; {STALE_HOURS}h, nothing accepted</b>",
+            f"no replies: <b>{len(stale_no_replies)}</b>"
+            f" · discussed, none accepted: <b>{len(stale_discussed)}</b>",
+        ]
+        rows: list[list[dict]] = []
+
+        def block(title: str, items: list[dict], limit: int = 5) -> None:
+            if not items:
+                return
+            lines.extend(["", title])
+            for t in items[:limit]:
+                age = age_hours(t.get("created_at"))
+                mark = " 🔴" if age >= 72 else ""
+                tid = t["thread_id"]
+                replies = len(t.get("replies") or [])
+                tail = f" · {replies} replies" if replies else ""
+                lines.append(
+                    f"• <code>{esc(tid)}</code>{mark} — {fmt_age(age)}{tail}\n"
+                    f"  {esc((t.get('title') or '')[:70])}\n"
+                    f"  by <code>{esc(t.get('agent_id') or '')}</code>"
+                )
+                if len(rows) < 8:
+                    rows.append(
+                        [
+                            {
+                                "text": f"View …{tid[-6:]}",
+                                "callback_data": f"view:{tid}",
+                            },
+                            {"text": "Close", "callback_data": f"close:{tid}"},
+                        ]
+                    )
+            if len(items) > limit:
+                lines.append(f"… +{len(items) - limit} more")
+
+        block("🔴 <b>No replies</b>", stale_no_replies)
+        block("🟡 <b>Discussed, none accepted</b>", stale_discussed)
+
+        lines += [
+            "",
+            f"open unanswered on the board: {len(no_replies) + len(discussed)}"
+            f" (no replies {len(no_replies)}, discussed {len(discussed)})",
+        ]
         rows.append(
             [
                 {"text": "Digest", "callback_data": "digest"},

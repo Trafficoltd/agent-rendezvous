@@ -132,8 +132,10 @@ def test_digest_counts_window_and_highlights(monkeypatch, captured):
     assert "new threads: <b>1</b>" in captured.text
     assert "new replies: <b>1</b>" in captured.text
     assert "new agents: <b>1</b>" in captured.text
-    assert "open unanswered: <b>2</b>" in captured.text
-    assert "stale &gt;24h: <b>1</b>" in captured.text
+    assert "open unanswered: <b>3</b>" in captured.text
+    assert "no replies 2, stale &gt;24h: <b>2</b>" in captured.text
+    assert "accepted: <b>0</b> (0%)" in captured.text
+    assert "tagged: <b>0</b> (0%)" in captured.text
     assert "citation edges: <b>1</b> | supersedes: <b>1</b>" in captured.text
     assert "positive 1" in captured.text
     assert "Top cited" in captured.text
@@ -155,13 +157,37 @@ def test_stale_lists_only_unanswered_old_threads(monkeypatch, captured):
 
     assert "thr-old" in captured.text
     assert "thr-fresh" not in captured.text
-    assert "thr-answered" not in captured.text
-    assert "open unanswered total: 2" in captured.text
-    assert any(
-        button["callback_data"] == "view:thr-old"
-        for row in captured.keyboard
-        for button in row
-    )
+    # a discussed thread with nothing accepted is still unresolved work
+    assert "thr-answered" in captured.text
+    assert "No replies" in captured.text
+    assert "Discussed, none accepted" in captured.text
+    assert "open unanswered on the board: 3 (no replies 2, discussed 1)" in captured.text
+    callbacks = [
+        button["callback_data"] for row in captured.keyboard for button in row
+    ]
+    assert "view:thr-old" in callbacks
+    assert "view:thr-answered" in callbacks
+
+
+def test_stale_ignores_threads_with_an_accepted_answer(monkeypatch, captured):
+    state = {
+        "introductions": [],
+        "threads": [
+            thread(
+                "thr-solved",
+                40,
+                replies=[reply("rep-1", 39)],
+                accepted_reply_id="rep-1",
+                status="resolved",
+            ),
+        ],
+    }
+    wire(monkeypatch, state)
+
+    tgbot.handle_stale(1)
+
+    assert "thr-solved" not in captured.text
+    assert "None: every open thread" in captured.text
 
 
 def test_stale_empty_state(monkeypatch, captured):
@@ -451,7 +477,12 @@ def test_monitor_primes_silently_and_detects_new_items():
     }
     monitor = tgbot.BoardMonitor()
     monitor.prime(base)
-    assert monitor.pending(base) == {"threads": [], "replies": [], "agents": []}
+    assert monitor.pending(base) == {
+        "threads": [],
+        "replies": [],
+        "agents": [],
+        "accepted": [],
+    }
 
     new = {
         "introductions": base["introductions"]
@@ -473,7 +504,85 @@ def test_monitor_primes_silently_and_detects_new_items():
     assert [i["agent_id"] for i in events["agents"]] == ["a-2"]
 
     monitor.commit(events)
-    assert monitor.pending(new) == {"threads": [], "replies": [], "agents": []}
+    assert monitor.pending(new) == {
+        "threads": [],
+        "replies": [],
+        "agents": [],
+        "accepted": [],
+    }
+
+
+def test_monitor_detects_an_accepted_answer():
+    """Acceptance is an UPDATE, not a new row: it must be detected by state."""
+    base = {
+        "introductions": [],
+        "threads": [thread("thr-1", 10, replies=[reply("rep-1", 9, agent="a-2")])],
+    }
+    monitor = tgbot.BoardMonitor()
+    monitor.prime(base)
+    assert monitor.pending(base)["accepted"] == []
+
+    solved = {
+        "introductions": [],
+        "threads": [
+            thread(
+                "thr-1",
+                10,
+                replies=[reply("rep-1", 9, agent="a-2")],
+                accepted_reply_id="rep-1",
+                status="resolved",
+            )
+        ],
+    }
+    events = monitor.pending(solved)
+
+    assert events["threads"] == [] and events["replies"] == []
+    assert events["accepted"] == [
+        {
+            "thread_id": "thr-1",
+            "title": "title of thr-1",
+            "agent_id": "a-1",
+            "reply_id": "rep-1",
+            "reply_agent_id": "a-2",
+        }
+    ]
+
+    monitor.commit(events)
+    assert monitor.pending(solved)["accepted"] == []
+
+
+def test_monitor_reports_a_moved_endorsement():
+    """Re-accepting a different reply is a new event, not a duplicate."""
+    monitor = tgbot.BoardMonitor()
+    monitor.prime(
+        {
+            "introductions": [],
+            "threads": [
+                thread(
+                    "thr-1",
+                    10,
+                    replies=[reply("rep-1", 9), reply("rep-2", 8, agent="a-3")],
+                    accepted_reply_id="rep-1",
+                )
+            ],
+        }
+    )
+    moved = {
+        "introductions": [],
+        "threads": [
+            thread(
+                "thr-1",
+                10,
+                replies=[reply("rep-1", 9), reply("rep-2", 8, agent="a-3")],
+                accepted_reply_id="rep-2",
+            )
+        ],
+    }
+
+    events = monitor.pending(moved)
+
+    assert [a["reply_id"] for a in events["accepted"]] == ["rep-2"]
+    assert events["accepted"][0]["reply_agent_id"] == "a-3"
 
 
 class SeqClient:
@@ -548,6 +657,57 @@ def test_format_alert_caps_each_type():
     assert text.count("• ") == 5
     assert "… +10 more threads" in text
     assert len(rows) == 6  # 5 thread buttons + footer
+
+
+def test_format_alert_has_accepted_section():
+    events = {
+        "threads": [],
+        "replies": [],
+        "agents": [],
+        "accepted": [
+            {
+                "thread_id": "thr-1",
+                "title": "memory pattern",
+                "agent_id": "a-1",
+                "reply_id": "rep-9",
+                "reply_agent_id": "a-2",
+            }
+        ],
+    }
+
+    text, rows = tgbot.format_alert(events)
+
+    assert "Answers accepted" in text
+    assert "✅ 1" in text
+    assert "rep-9" in text and "a-2" in text
+    callbacks = [b["callback_data"] for row in rows for b in row]
+    assert "view:thr-1" in callbacks
+
+
+def test_metrics_shows_accepted_and_unanswered(monkeypatch, captured):
+    class MetricsClient:
+        def __init__(self, base):
+            self.base = base
+
+        def metrics(self):
+            return {
+                "introductions": 26,
+                "threads_open": 73,
+                "threads_resolved": 1,
+                "threads_closed": 2,
+                "threads_total": 76,
+                "threads_with_accepted_answer": 1,
+                "threads_unanswered": 73,
+                "replies_total": 222,
+                "updated_at": "2026-10-24T00:00:00+00:00",
+            }
+
+    monkeypatch.setattr(tgbot, "BoardClient", MetricsClient)
+
+    tgbot.handle_metrics(1)
+
+    assert "accepted answers: <b>1</b> (1%)" in captured.text
+    assert "unanswered (nothing accepted): <b>73</b>" in captured.text
 
 
 def test_alert_chat_ids_prefers_explicit_chat(monkeypatch):
