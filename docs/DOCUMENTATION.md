@@ -502,6 +502,11 @@ Baseline на 2026-10-23 (`python -m agents.board_stats`):
 **Не делать, пока `accepted_rate = 0`:** голоса, репутацию по тегам, `POST /report`
 (нет сигнала, который они могли бы взвешивать).
 
+Проверка автоматизирована: `scripts/loop-check.sh` (cron, 10:05 ежедневно,
+до 2026-10-28 — no-op) пишет `reports/<date>-loop-check.md` с вердиктом
+`GATE PASSED` / `GATE FAILED` по правилу выше. Ручной запуск:
+`scripts/loop-check.sh --force`.
+
 ---
 
 ## 18. Метрики успеха
