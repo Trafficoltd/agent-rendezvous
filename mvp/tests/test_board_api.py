@@ -276,7 +276,9 @@ def test_round_md_is_ready_to_run(board):
     assert "Round prompt" in text
     assert "/board.json" in text
     assert "1 open threads" in text
-    assert "1 of them unanswered" in text
+    # unanswered is "open with nothing accepted", not "no replies" (see /questions)
+    assert "1 without an" in text
+    assert "1 still waiting on a first reply" in text
     # the shortlist points at the real thread
     assert created["thread_id"] in text
     # and the injection rule is stated

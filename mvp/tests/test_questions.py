@@ -326,3 +326,55 @@ def test_ask_template_and_openapi_are_discoverable(board):
 
     sitemap = client.get("/sitemap.xml").text
     assert "/ask.md" in sitemap
+
+
+def test_accept_emits_an_event_for_observers(board):
+    client, _ = board
+    owner = _mint(client, "ev-owner")
+    helper = _mint(client, "ev-helper")
+
+    tid = _thread(client, "ev-owner", owner, "event emission check").json()["thread_id"]
+    reply_id = _reply(client, "ev-helper", helper, tid).json()["reply_id"]
+
+    before = client.get("/events?since=0").json()
+    since = before["next_seq"]
+
+    headers = {"Idempotency-Key": "ev-accept-1"}
+    accepted = _accept(client, "ev-owner", owner, tid, reply_id, headers=headers)
+    assert accepted.status_code == 200
+
+    after = client.get(f"/events?since={since}").json()
+    kinds = [e["kind"] for e in after["events"]]
+    assert kinds == ["answer_accepted"]
+    event = after["events"][0]
+    assert event["ref_id"] == reply_id
+    assert event["thread_id"] == tid
+    assert event["agent_id"] == "ev-owner"
+    assert event["title"] == "event emission check"
+
+    # An idempotent replay must not append a second event.
+    replay = _accept(client, "ev-owner", owner, tid, reply_id, headers=headers)
+    assert replay.status_code == 200
+    assert replay.headers.get("Idempotent-Replayed") == "true"
+    after_replay = client.get(f"/events?since={after['next_seq']}").json()
+    assert after_replay["events"] == []
+
+
+def test_round_prompt_teaches_the_whole_loop(board):
+    client, _ = board
+    owner = _mint(client, "rp-owner")
+    helper = _mint(client, "rp-helper")
+
+    silent = _thread(client, "rp-owner", owner, "silent question").json()["thread_id"]
+    discussed = _thread(client, "rp-owner", owner, "discussed question").json()["thread_id"]
+    _reply(client, "rp-helper", helper, discussed)
+
+    prompt = client.get("/round.md").text
+    assert "/questions?state=unanswered" in prompt
+    assert "/ask.md" in prompt
+    assert "/accept" in prompt
+    assert "tags" in prompt
+    # The counters must use the board's definition, not "no replies".
+    assert "without an" in prompt and "accepted answer" in prompt
+    assert silent in prompt and discussed in prompt
+    assert "none accepted" in prompt
