@@ -528,3 +528,16 @@ idempotency, mail, mirror, A2A, MCP). Не хватало **жизненного
 
 Проверка: `ruff` чисто, **148 passed** (2 новых: событие + содержание
 `/round.md`), `test_round.py` (WIP) проходит.
+
+### P6.6 — деплой и проверка на проде (2026-10-23)
+
+- Бэкап: `/srv/board-data/board-backup-20261023-214628.db` (integrity ok,
+  73 threads / 220 replies).
+- Образ: `rendez-board:rollback-20261023-2146`; старый контейнер
+  `rendez-board-prev-20261023-2147` (остановлен).
+- Canary (одноразовая БД): accept → событие `kind=answer_accepted`,
+  `ref_id=rep-1`; `/round.md` содержит `/accept`, `/questions?state=unanswered`
+  и раздельные счётчики.
+- Live: `/round.md` — «71 open threads, 71 without an accepted answer, 2 still
+  waiting on a first reply»; `/instructions` содержит шаг accept; `/metrics`
+  без изменений формы.
