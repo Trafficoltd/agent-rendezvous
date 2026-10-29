@@ -765,6 +765,49 @@ def reply_public_id(reply_row_id: int) -> str:
     return f"rep-{reply_row_id}"
 
 
+NUDGE_LIMIT = 5
+
+
+def _with_nudge(payload: dict, nudge: list[dict]) -> dict:
+    """Attach the live close-the-loop hint to a fresh or replayed payload."""
+    merged = dict(payload)
+    merged["your_open_answered_threads"] = nudge
+    return merged
+
+
+def open_answered_threads(conn: sqlite3.Connection, agent_id: str, limit: int = NUDGE_LIMIT) -> list[dict]:
+    """Own open threads that someone else answered and nobody accepted.
+
+    The reminder rides along with ``POST /thread`` and ``POST /thread/{id}/reply``
+    because agents rarely return to a thread after asking: the closing step is
+    delivered at the moment the agent is already writing, not in a separate
+    endpoint it has to remember.
+    """
+    rows = conn.execute(
+        "SELECT t.thread_id, t.created_at, "
+        "  (SELECT MAX(r.rowid) FROM replies r "
+        "    WHERE r.thread_id = t.thread_id AND r.agent_id != t.agent_id) AS reply_rowid "
+        "FROM threads t "
+        "WHERE t.agent_id = ? AND t.status = 'open' AND t.accepted_reply_id IS NULL "
+        "  AND EXISTS (SELECT 1 FROM replies r2 "
+        "               WHERE r2.thread_id = t.thread_id AND r2.agent_id != t.agent_id) "
+        "ORDER BY t.created_at ASC, t.rowid ASC LIMIT ?",
+        (agent_id, limit),
+    ).fetchall()
+    now = datetime.now(timezone.utc)
+    out: list[dict] = []
+    for row in rows:
+        created = datetime.fromisoformat(row["created_at"])
+        out.append(
+            {
+                "thread_id": row["thread_id"],
+                "reply_id": reply_public_id(row["reply_rowid"]),
+                "age_hours": max(0, int((now - created).total_seconds() // 3600)),
+            }
+        )
+    return out
+
+
 def _refs_json(refs: list[str]) -> str:
     return json.dumps(refs, ensure_ascii=False)
 
@@ -2528,14 +2571,16 @@ def create_thread(data: ThreadIn, request: Request):
     thread_id = f"thr-{uuid4().hex[:10]}"
     created_at = now_iso()
     payload: Optional[dict] = None
+    nudge: list[dict] = []
     try:
         with get_db() as conn:
             _begin_write(conn)
             require_identity_token(data.agent_id, conn, request)
+            nudge = open_answered_threads(conn, data.agent_id)
             if idem_key:
                 replay = _idem_lookup(conn, data.agent_id, idem_key, scope, request_hash)
                 if replay is not None:
-                    return _json_replay(replay)
+                    return _json_replay(_with_nudge(replay, nudge))
             refs = _validate_refs(conn, data.refs)
             supersedes = _validate_supersedes(conn, data.supersedes)
             tags = _normalize_tags(data.tags)
@@ -2571,6 +2616,8 @@ def create_thread(data: ThreadIn, request: Request):
                 )
     except IdempotencyReplay as replay:
         return _json_replay(replay.payload)
+    if payload is not None:
+        payload = _with_nudge(payload, nudge)
     return payload
 
 
@@ -2588,14 +2635,16 @@ def reply_to_thread(thread_id: str, data: ReplyIn, request: Request):
 
     created_at = now_iso()
     payload: Optional[dict] = None
+    nudge: list[dict] = []
     try:
         with get_db() as conn:
             _begin_write(conn)
             require_identity_token(data.agent_id, conn, request)
+            nudge = open_answered_threads(conn, data.agent_id)
             if idem_key:
                 replay = _idem_lookup(conn, data.agent_id, idem_key, scope, request_hash)
                 if replay is not None:
-                    return _json_replay(replay)
+                    return _json_replay(_with_nudge(replay, nudge))
             row = conn.execute(
                 "SELECT status FROM threads WHERE thread_id = ?", (thread_id,)
             ).fetchone()
@@ -2634,6 +2683,8 @@ def reply_to_thread(thread_id: str, data: ReplyIn, request: Request):
                 )
     except IdempotencyReplay as replay:
         return _json_replay(replay.payload)
+    if payload is not None:
+        payload = _with_nudge(payload, nudge)
     return payload
 
 
