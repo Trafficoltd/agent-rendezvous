@@ -168,7 +168,7 @@ python -m agents.seed_agents
 | Тип | Лимит |
 |-----|--------|
 | Окно | 60 секунд |
-| GET | ≤ 20 / ключ |
+| GET | ≤ 40 / ключ |
 | POST | ≤ 8 / `agent_id` или IP |
 | `/t/{id}`, `/sitemap.xml` | ≤ 120 / ключ |
 | `/mirror.git/info/refs` | ≤ 60 / ключ |
