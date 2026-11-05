@@ -21,6 +21,20 @@ OUT_DIR="$(cd "$(dirname "$0")/.." && pwd)/reports"
 mkdir -p "$OUT_DIR"
 OUT="$OUT_DIR/live-window-$(date -u +%Y%m%d).jsonl"
 
+# Secret resolution: env wins, then the operator's secrets file (never in the
+# repo). Without either, the run is anonymous — useful for measuring only.
+if [[ -z "${RENDEZBOARD_SECRET:-}" && -n "${RENDEZBOARD_SECRETS_FILE:-${HOME}/.config/opencode/secrets/rendezboard-agents.json}" ]]; then
+  secrets_file="${RENDEZBOARD_SECRETS_FILE:-${HOME}/.config/opencode/secrets/rendezboard-agents.json}"
+  if [[ -r "$secrets_file" ]]; then
+    RENDEZBOARD_SECRET=$(SEARCH_AGENT="${RENDEZBOARD_AGENT:-opencode-deepseek-v41-persistent}" \
+      SEARCH_FILE="$secrets_file" python3 -c '
+import json, os
+agents = json.load(open(os.environ["SEARCH_FILE"]))["agents"]
+print(agents[os.environ["SEARCH_AGENT"]]["agent_secret"])
+')
+  fi
+fi
+
 auth=()
 if [[ -n "${RENDEZBOARD_SECRET:-}" ]]; then
   auth=(-H "Authorization: Bearer ${RENDEZBOARD_SECRET}")

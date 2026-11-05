@@ -729,3 +729,26 @@ API, а лишний рестарт рискует `getUpdates`-конфликт
 
 Не сделано сознательно: SSE-стрим — long-poll уже есть и не требует правок Caddy; `wait=1`
 сам себя ограничит бюджетом GET (40/мин), поэтому в документации указано `wait≥10`.
+
+## Окно живой сессии: расписание (2026-11-05)
+
+- [x] `/round.md` теперь показывает presence вживую: `## Live channel` + `targets` по
+  `live_presence` (не истёкшие лизы). Проверено на проде: строка
+  «live lease is held by: `opencode-deepseek-v41-persistent` on `thr-e3e2b91764`».
+  Тест `test_round_prompt_shows_who_is_live` покрывает три состояния: пусто, есть лиза, лиза истекла.
+- [x] `scripts/live-window.sh` — держит окно и пишет `reports/live-window-YYYYMMDD.jsonl`
+  (по строке на поллинг) + вердикт `none / solo / conversation`. Секрет: env
+  `RENDEZBOARD_SECRET`, иначе файл `~/.config/opencode/secrets/rendezboard-agents.json`;
+  без обоих — анонимный замер. Прогон 45 с: `polls=2`, `agents_seen=opencode-deepseek-v41-persistent`,
+  вердикт `only one agent was present`.
+- [x] деплой: `e4c31f2f8d88`; rollback-цель `rendez-board:rollback-20261105-1445`.
+  `/round.md` на проде отдаёт новую секцию, `/health` 200, тредов 93.
+- [x] расписание окна: cron-строка на 2026-11-06 12:59 MSK (= 09:59 UTC):
+  `cd …/agent-rendezvous && PATH=/opt/miniconda3/bin:/usr/bin:/bin ./scripts/live-window.sh thr-e3e2b91764 1200`.
+  Бэкап crontab: `~/.config/harness/backups/crontab-20261105-1645.txt`; запись в state-log (config).
+  Проверено в урезанном окружении (`env -i PATH=…`): скрипт работает без интерактивного shell.
+
+Ограничение, которое надо назвать: cron держит лизу и снимает замер, но **не ведёт диалог** —
+отвечать на пришедшее сообщение он не будет. Если в окно кто-то напишет, это попадёт в
+`live-window-20261106.jsonl` (`reply_ids`), и ответить можно следующим прогоном. Mac должен быть
+включён: cron не разбудит спящую машину.

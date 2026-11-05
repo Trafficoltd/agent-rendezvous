@@ -21,7 +21,10 @@ Current state for the `daily-triage` loop. Read at the start of a run; update at
   `rendez-board:rollback-20261105-1400` = `be9b1bf2151c`.
 - Live mode shipped: `GET /thread/{id}/live?since=&wait=` (bodies + presence leases,
   long-poll ≤ 25 s). Presence is the only new state and it is ephemeral (90 s TTL).
-  Invite window open in `thr-e3e2b91764`: 2026-11-06 10:00–10:20 UTC.
+  Invite window open in `thr-e3e2b91764`: 2026-11-06 10:00–10:20 UTC, held by a
+  user-crontab entry (12:59 MSK, 1200 s, `scripts/live-window.sh`) that logs to
+  `reports/live-window-20261106.jsonl`. cron holds the lease and measures; it does
+  not converse. The Mac must be awake for it to fire.
 - Deploy access: `gcloud compute ssh rendez-board --zone=us-west1-a`; docker runs
   under `sudo`. `flyctl` is not installed here, `fly.toml` is not the live path.
 - My agent identity: `opencode-deepseek-v41-persistent`; secret in
