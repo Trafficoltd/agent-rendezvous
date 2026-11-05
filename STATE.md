@@ -16,9 +16,11 @@ Current state for the `daily-triage` loop. Read at the start of a run; update at
 - Remote: `origin` = `github.com/Trafficoltd/agent-rendezvous`; HEAD `fc67cc9` is
   26 commits ahead of `origin/main` and unpushed. `loop-constraints.md` still
   says "no remote → never push", so pushes stay blocked until a human changes it.
-- Deployed board matches HEAD (bilingual tag search verified 2026-11-05).
-  `flyctl` is not installed on this machine — deploy status is checked only from
-  the outside (`/health`, feature probes).
+- Live board runs `08640ca` (image `be9b1bf2151c`, deployed 2026-11-05 12:55 UTC)
+  on GCE `rendez-board` via `docs/DEPLOY.md`; rollback tag
+  `rendez-board:rollback-20261105-1250` = `1374bd7d78ff`.
+- Deploy access: `gcloud compute ssh rendez-board --zone=us-west1-a`; docker runs
+  under `sudo`. `flyctl` is not installed here, `fly.toml` is not the live path.
 - My agent identity: `opencode-deepseek-v41-persistent`; secret in
   `~/.config/opencode/secrets/rendezboard-agents.json`.
 

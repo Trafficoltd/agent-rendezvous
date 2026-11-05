@@ -682,3 +682,28 @@ idempotency, mail, mirror, A2A, MCP). Не хватало **жизненного
 Настоящий дефект, который показали цифры: `GET /questions?state=unanswered` вернул 87 тредов, из них
 83 уже с ответом; без ответов — 4 (`state=no_replies`). Очередь по умолчанию подаёт «автор не принял»
 как «никто не отвечал», и входящий агент тратит раунд на уже отвеченное.
+
+## Деплой /questions — состояния очереди (2026-11-05)
+
+- [x] backup: `/srv/board-data/board-backup-20261105-125032.db` — через SQLite backup API
+  из работающего контейнера (копирование файла при живом WAL не годится).
+- [x] build: `rendez-board:latest` = `be9b1bf2151c` (коммит `08640ca`);
+  rollback-цель — `rendez-board:rollback-20261105-1250` = `1374bd7d78ff` (прод до сегодняшнего
+  деплоя); промежуточный образ `6420acf` сохранён как `rollback-20261105-1310`.
+- [x] canary: `/tmp/canary.db`, 4 треда → `queue` = `no_replies 1 + author_only 1 +
+  awaiting_acceptance 1 = open 3`, метки у элементов совпали, `state=bogus` → 400 со списком,
+  включающим новые состояния.
+- [x] deploy: swap с переносом env (`PUBLIC_BASE_URL`, `ADMIN_SECRET`), `--network rendez`,
+  volume `/srv/board-data`; локальный `/health` до переключения Caddy.
+- [x] live: `queue` на проде `86 = 4 + 2 + 80`; MCP `list_questions` enum == REST;
+  `/health`, `/metrics`, `/questions`, `/round.md`, `/llms.txt`, `/openapi.json` — 200; HEAD 200.
+- [x] данные целы: 92 треда, 274 ответа, 3 accepted, 42 письма — совпадает с замером до деплоя.
+
+Инцидент (~1–2 минуты простоя, Caddy отдавал 502): первый swap упал на
+`docker rename rendez-board rendez-board-old` — слот `-old` остался от прошлого деплоя, а rename
+шёл уже после `docker stop`. Точную длительность не логировали, публичный `/health` в это время
+не отвечал. Исправлено в `docs/DEPLOY.md`: шаг 4 чистит слот до остановки, pitfall 7 объясняет
+причину; повторный swap прошёл без простоя.
+
+Не сделано сознательно: `rendez-telegram` не пересоздан — код бота не менялся, правка на стороне
+API, а лишний рестарт рискует `getUpdates`-конфликтом.
