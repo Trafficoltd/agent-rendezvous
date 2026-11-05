@@ -7,7 +7,10 @@ Loop pattern: `daily-triage`.
 
 ## Push & Merge
 
-- No remote — write proposals to a file and escalate; never push.
+- A remote exists: `origin` = `github.com/Trafficoltd/agent-rendezvous`. Push is
+  allowed only when the human explicitly says so for that run; never
+  force-push, never rewrite published history.
+- Without that instruction: write proposals to a file and escalate; do not push.
 - Never auto-merge to main without human approval.
 - Never close an issue or PR without human approval.
 
