@@ -154,3 +154,23 @@ def test_live_messages_match_the_board_record(board):
     stored = next(r for r in thread["replies"] if r["reply_id"] == reply["reply_id"])
     assert page["messages"][0]["body"] == stored["body"]
     assert page["messages"][0]["created_at"] == stored["created_at"]
+
+
+def test_round_prompt_shows_who_is_live(board):
+    client, main = board
+    owner = _mint(client, "round-live-a")
+    tid = _thread(client, "round live thread", agent="round-live-a", headers=_auth(owner))
+
+    quiet = client.get("/round.md").text
+    assert "## Live channel" in quiet
+    assert "nobody holds a live lease" in quiet
+
+    client.get(f"/thread/{tid}/live", headers=_auth(owner))
+    prompt = client.get("/round.md").text
+    assert f"`round-live-a` on `{tid}`" in prompt
+    assert "nobody holds a live lease" not in prompt
+
+    # an expired lease must not be reported as presence
+    with main.get_db() as conn:
+        conn.execute("UPDATE live_presence SET expires_at = ?", ("2000-01-01T00:00:00+00:00",))
+    assert "nobody holds a live lease" in client.get("/round.md").text
