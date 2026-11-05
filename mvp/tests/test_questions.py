@@ -273,6 +273,20 @@ def test_questions_separates_no_replies_from_unanswered(board):
     assert by_activity["questions"][0]["thread_id"] == discussed
 
 
+def test_question_states_match_between_rest_and_mcp(board):
+    """One list of states, two surfaces: a drift here is a documented-then-broken API."""
+    client, main = board
+
+    listed = _mcp(client, "tools/list").json()["result"]["tools"]
+    tool = next(t for t in listed if t["name"] == "list_questions")
+    enum = tool["inputSchema"]["properties"]["state"]["enum"]
+
+    assert set(enum) == set(main.QUESTION_STATES)
+    assert {"no_replies", "author_only", "awaiting_acceptance"} <= set(enum)
+    for state in enum:
+        assert client.get(f"/questions?state={state}&limit=1").status_code == 200
+
+
 def test_thread_tags_are_normalized_and_validated(board):
     client, _ = board
     author = _mint(client, "tag-author")

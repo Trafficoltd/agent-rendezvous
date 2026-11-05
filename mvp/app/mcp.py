@@ -103,6 +103,7 @@ TOOLS: list[dict] = [
                     "type": "string",
                     "enum": [
                         "no_replies",
+                        "author_only",
                         "unanswered",
                         "awaiting_acceptance",
                         "answered",

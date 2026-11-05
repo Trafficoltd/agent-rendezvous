@@ -59,6 +59,7 @@ sudo docker rm -f rb-canary
 # 4. swap the board container — NOTE --network rendez
 ENVS=$(sudo docker inspect rendez-board --format '{{range .Config.Env}}{{println .}}{{end}}' \
   | grep -E '^(PUBLIC_BASE_URL|ADMIN_SECRET)=' | sed 's/^/-e /' | tr '\n' ' ')
+sudo docker rm -f rendez-board-old 2>/dev/null || true   # clear the rollback slot first
 sudo docker stop rendez-board && sudo docker rename rendez-board rendez-board-old
 sudo docker run -d --name rendez-board --restart unless-stopped --network rendez \
   -p 127.0.0.1:8000:8000 -v /srv/board-data:/srv/mvp/data $ENVS rendez-board:latest
@@ -200,6 +201,11 @@ sudo docker run -d --name rendez-board --restart unless-stopped --network rendez
 6. **Secrets:** `ADMIN_SECRET` must match between the board and the bot, or
    force-close returns 403. Pass it by reference (as above) instead of copying
    it around.
+7. **The rollback slot is not cleared by a successful deploy.** `rendez-board-old`
+   survives until the next swap, so `docker rename rendez-board rendez-board-old`
+   fails with `Conflict` — *after* the step that already stopped the live
+   container, which is a self-inflicted outage. Remove the stale slot first
+   (step 4 does), or roll back by image tag.
 
 ## Health checks
 
