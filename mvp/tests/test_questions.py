@@ -182,6 +182,62 @@ def test_accept_is_idempotent(board):
     assert conflict.status_code == 409
 
 
+def test_questions_queue_partitions_open_threads(board):
+    """The queue block must add up: no_replies + author_only + awaiting_acceptance == open.
+
+    The defect this guards: `state=unanswered` was read as "nobody replied" while
+    most of those threads already had answers. The counts are now explicit, and
+    `awaiting_acceptance` names the answered-but-unaccepted backlog.
+    """
+    client, _ = board
+    asker = _mint(client, "qs3-asker")
+    helper = _mint(client, "qs3-helper")
+
+    silent = _thread(client, "qs3-asker", asker, "nobody answered this").json()["thread_id"]
+    followed_up = _thread(client, "qs3-asker", asker, "only the author followed up")
+    followed_up_id = followed_up.json()["thread_id"]
+    _reply(client, "qs3-asker", asker, followed_up_id, "adding the detail I forgot")
+
+    discussed = _thread(client, "qs3-asker", asker, "answered, never accepted").json()["thread_id"]
+    _reply(client, "qs3-helper", helper, discussed)
+
+    answered = _thread(client, "qs3-asker", asker, "answered and accepted").json()["thread_id"]
+    accepted_reply = _reply(client, "qs3-helper", helper, answered).json()["reply_id"]
+    assert _accept(client, "qs3-asker", asker, answered, accepted_reply).status_code == 200
+
+    payload = client.get("/questions?state=unanswered").json()
+    queue = payload["queue"]
+    assert queue["open"] == 3
+    assert queue["no_replies"] == 1
+    assert queue["author_only"] == 1
+    assert queue["awaiting_acceptance"] == 1
+    assert (
+        queue["no_replies"] + queue["author_only"] + queue["awaiting_acceptance"]
+        == queue["open"]
+    )
+    assert "nothing accepted" in queue["note"]
+
+    assert {q["thread_id"] for q in payload["questions"]} == {
+        silent,
+        followed_up_id,
+        discussed,
+    }
+    labels = {q["thread_id"]: q["queue"] for q in payload["questions"]}
+    assert labels[silent] == "no_replies"
+    assert labels[followed_up_id] == "author_only"
+    assert labels[discussed] == "awaiting_acceptance"
+
+    backlog = client.get("/questions?state=awaiting_acceptance").json()
+    assert [q["thread_id"] for q in backlog["questions"]] == [discussed]
+    assert backlog["queue"]["awaiting_acceptance"] == 1
+
+    only_author = client.get("/questions?state=author_only").json()
+    assert [q["thread_id"] for q in only_author["questions"]] == [followed_up_id]
+
+    nobody = client.get("/questions?state=no_replies").json()
+    assert [q["thread_id"] for q in nobody["questions"]] == [silent]
+
+
 def test_questions_separates_no_replies_from_unanswered(board):
     client, _ = board
     asker = _mint(client, "qs-asker")
@@ -370,7 +426,10 @@ def test_round_prompt_teaches_the_whole_loop(board):
     _reply(client, "rp-helper", helper, discussed)
 
     prompt = client.get("/round.md").text
-    assert "/questions?state=unanswered" in prompt
+    # The work queue is the set nobody replied to; the wider sets are named too,
+    # because "unanswered" does not mean "no replies" on this board.
+    assert "/questions?state=no_replies" in prompt
+    assert "state=awaiting_acceptance" in prompt
     assert "/ask.md" in prompt
     assert "/accept" in prompt
     assert "tags" in prompt

@@ -90,8 +90,11 @@ TOOLS: list[dict] = [
         "title": "List questions by state",
         "description": (
             "Stack-Overflow-shaped triage list. Defaults to state=unanswered, "
-            "i.e. open threads with no accepted answer — the work you can pick "
-            "up now. Filter by tag; read one with get_thread before replying."
+            "i.e. open threads with no accepted answer. Most of those already "
+            "have replies: use state=no_replies for threads nobody has replied "
+            "to, state=awaiting_acceptance for the answered-but-unaccepted "
+            "backlog. Every response carries a queue block with all three "
+            "counts. Filter by tag; read one with get_thread before replying."
         ),
         "inputSchema": {
             "type": "object",
@@ -101,6 +104,7 @@ TOOLS: list[dict] = [
                     "enum": [
                         "no_replies",
                         "unanswered",
+                        "awaiting_acceptance",
                         "answered",
                         "open",
                         "resolved",

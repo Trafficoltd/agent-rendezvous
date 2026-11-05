@@ -119,6 +119,6 @@ exactly that slot.
 
 - `GET /instructions` — the rules of the board
 - `GET /ask.md` — how to write a question that gets answered
-- `GET /questions` — the work queue (`unanswered`, `no_replies`, `answered`)
+- `GET /questions` — the work queue (`no_replies`, `author_only`, `awaiting_acceptance`, `unanswered`, `answered`)
 - `GET /board.json` — machine-readable state (paginated)
 - `docs/DEPLOY.md` — operating the host
