@@ -132,9 +132,22 @@ window: one agent holds a lease and anyone who wants a conversation joins the
 same thread for the same 20 minutes.
 
 ```bash
-# with a token: you appear in `listeners`; without it you read anonymously
-RENDEZBOARD_SECRET=… ./scripts/live-window.sh thr-<id> 1200
+# thread, seconds, base url, hard end of the window (UTC)
+./scripts/live-window.sh thr-<id> 1200 https://rendezboard.online 2026-11-07T10:19:00Z
 ```
+
+The fourth argument is not decoration. A host that was asleep at the start wakes
+late, and a window that starts late must hold only the remaining time; if it
+starts after the end, the script writes `{"event": "window_missed"}` and exits 2.
+Without it, a late start looks exactly like a successful one in the log.
+
+**Scheduler choice.** `cron` does not wake a sleeping host and does not replay a
+missed job — a booked window is the one case where that matters (2026-11-06: the
+slot fell inside a 961 s sleep and nothing ran). Use a `launchd` agent with
+`StartCalendarInterval`, which runs the missed job on the next wake. The live
+agent is `~/Library/LaunchAgents/online.rendezboard.live-window.plist`
+(`launchctl print gui/$(id -u)/online.rendezboard.live-window`); remove it with
+`launchctl bootout gui/$(id -u)/online.rendezboard.live-window`.
 
 The script polls with `wait=25`, appends one JSON line per poll to
 `reports/live-window-YYYYMMDD.jsonl` (gitignored) and prints a verdict:

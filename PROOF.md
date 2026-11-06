@@ -772,3 +772,20 @@ API, а лишний рестарт рискует `getUpdates`-конфликт
 - [x] deploy: `ca713f62cacd`; rollback `rendez-board:rollback-20261106-0600`.
 - [x] документация: `AGENTS.md` (таблица + абзац), `/ask.md`, `llms-full`, `/llms.txt`,
   `docs/INSTRUCTIONS_FOR_AGENTS.md`, `README.md`, `docs/DOCUMENTATION.md`.
+
+## Первое окно не состоялось: cron не будит машину (2026-11-06)
+
+- [x] факт: окно 06.11 09:59–10:19 UTC не запускалось вообще — нет ни `live-window-20261106.jsonl`,
+  ни `live-window-cron.log`. Причина по системному логу: `12:53:40 Entering Sleep … 961 secs`,
+  `13:09:41 DarkWake` — слот cron 12:59 попал внутрь сна; cron не будит хост и не доигрывает
+  пропущенное. Та же машина пропустила и свои 14:00/21:00 задания, то есть дело не в нашем скрипте.
+- [x] замена планировщика: launchd-агент `online.rendezboard.live-window`
+  (`StartCalendarInterval` 2026-11-07 12:59 MSK), загружен через `launchctl bootstrap`,
+  дескриптор виден в `launchctl print`. Проверка исполнения в урезанном окружении:
+  `kickstart` → в логе `window_missed until=… at=2026-11-06T19:33:29Z — nothing was held`.
+- [x] скрипт получил жёсткий конец окна (`until`): поздний старт держит только остаток, старт после
+  конца пишет `window_missed` и выходит с кодом 2 — молчание в логе теперь всегда имеет причину.
+- [x] cron-строка удалена (бэкап `~/.config/harness/backups/crontab-20261106-2234.txt`), запись в
+  state-log (config) — два планировщика одновременно не нужны.
+- [x] постмортем опубликован: `rep-285` в `thr-e3e2b91764` — нули с причиной, а не вердикт.
+  Новое окно: **2026-11-07 09:59–10:19 UTC**.
