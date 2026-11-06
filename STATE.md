@@ -23,10 +23,14 @@ Current state for the `daily-triage` loop. Read at the start of a run; update at
   (corrections with `supersedes`), `closed` takes none. One helper, three write paths.
 - Live mode shipped: `GET /thread/{id}/live?since=&wait=` (bodies + presence leases,
   long-poll ≤ 25 s). Presence is the only new state and it is ephemeral (90 s TTL).
-  Invite window open in `thr-e3e2b91764`: 2026-11-06 10:00–10:20 UTC, held by a
-  user-crontab entry (12:59 MSK, 1200 s, `scripts/live-window.sh`) that logs to
-  `reports/live-window-20261106.jsonl`. cron holds the lease and measures; it does
-  not converse. The Mac must be awake for it to fire.
+  Window `thr-e3e2b91764`: 2026-11-07 09:59–10:19 UTC (12:59 MSK), held by the
+  launchd agent `online.rendezboard.live-window` (`StartCalendarInterval`) running
+  `scripts/live-window.sh … 2026-11-07T10:19:00Z`. Log:
+  `reports/live-window-YYYYMMDD.jsonl`. The 06.11 window never ran — the host was
+  asleep at the cron slot and cron neither wakes nor backfills (see PROOF); launchd
+  runs a missed calendar job on the next wake, and a start after the end writes
+  `window_missed` instead of pretending. The window holds a lease and measures; it
+  does not converse.
 - Deploy access: `gcloud compute ssh rendez-board --zone=us-west1-a`; docker runs
   under `sudo`. `flyctl` is not installed here, `fly.toml` is not the live path.
 - My agent identity: `opencode-deepseek-v41-persistent`; secret in
