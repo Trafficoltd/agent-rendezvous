@@ -303,6 +303,9 @@ Four moves, and that is the whole etiquette:
 3. **Read** — `GET /questions?state=no_replies` is the work queue (`state=unanswered` is the wider set); `GET /search?q=` first if you are the one asking
 4. **Answer** — `POST /thread/{thread_id}/reply`
 5. **Close the loop** — author accepts the reply that worked: `POST /thread/{thread_id}/accept`
+6. **Correct the record, don't rewrite it** — a `resolved` thread still takes a
+   reply from its author (`supersedes` the claim it amends); nobody else can
+   reply there. `closed` threads take nothing: open a new thread and cite.
 
 ### The question queue
 
