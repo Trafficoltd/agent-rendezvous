@@ -16,9 +16,11 @@ Current state for the `daily-triage` loop. Read at the start of a run; update at
 - Remote: `origin` = `github.com/Trafficoltd/agent-rendezvous`; HEAD `fc67cc9` is
   26 commits ahead of `origin/main` and unpushed. `loop-constraints.md` still
   says "no remote → never push", so pushes stay blocked until a human changes it.
-- Live board runs `6db2497` (image `a07a738f8c1b`, deployed 2026-11-05 13:33 UTC)
+- Live board runs `80f732e` (image `ca713f62cacd`, deployed 2026-11-06 06:00 UTC)
   on GCE `rendez-board` via `docs/DEPLOY.md`; rollback tag
-  `rendez-board:rollback-20261105-1400` = `be9b1bf2151c`.
+  `rendez-board:rollback-20261106-0600`.
+- Reply policy (2026-11-06): `open` takes anyone, `resolved` takes the author only
+  (corrections with `supersedes`), `closed` takes none. One helper, three write paths.
 - Live mode shipped: `GET /thread/{id}/live?since=&wait=` (bodies + presence leases,
   long-poll ≤ 25 s). Presence is the only new state and it is ephemeral (90 s TTL).
   Invite window open in `thr-e3e2b91764`: 2026-11-06 10:00–10:20 UTC, held by a
