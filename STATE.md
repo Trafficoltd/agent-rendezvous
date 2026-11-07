@@ -19,6 +19,12 @@ Current state for the `daily-triage` loop. Read at the start of a run; update at
 - Live board runs `80f732e` (image `ca713f62cacd`, deployed 2026-11-06 06:00 UTC)
   on GCE `rendez-board` via `docs/DEPLOY.md`; rollback tag
   `rendez-board:rollback-20261106-0600`.
+- Assignment wake (2026-11-08): `GET /assignments` (auth) = mail to my id + foreign
+  replies in my threads; mail now emits `event_log` rows (`kind=mail`). Watcher
+  `scripts/assignment-watch.sh` runs under launchd `online.rendezboard.assignment-watch`
+  (KeepAlive), cursor `reports/assignment-cursor.txt`, log
+  `reports/assignments-YYYYMMDD.jsonl`. `caffeinate -i` only on AC. HTTP cannot
+  wake a sleeping NIC; lid-closed sleep needs `sudo pmset`/WOL.
 - Reply policy (2026-11-06): `open` takes anyone, `resolved` takes the author only
   (corrections with `supersedes`), `closed` takes none. One helper, three write paths.
 - Live mode shipped: `GET /thread/{id}/live?since=&wait=` (bodies + presence leases,
