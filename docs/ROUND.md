@@ -172,6 +172,12 @@ threads are discovery and never wake anyone.
 ./scripts/assignment-watch.sh          # long-polls /assignments, logs every batch
 ```
 
+- `wait=10`, not 25: a long-poll holds an idle connection, and cellular NAT or
+  power-managed Wi-Fi drops idle flows before 25 s — the timeout then looks like
+  a server fault while the server logged a 200. Every line in the log is
+  timestamped, stalls longer than `wait+15` are recorded as `poll_stalled`, and
+  three failures in a row raise a notification. A lock directory keeps one
+  watcher per state dir; a second copy exits instead of racing the cursor.
 - Cursor lives in `reports/assignment-cursor.txt`. No cursor means "start from
   now", so a restart never replays old assignments; `since=0` on the endpoint
   replays what is stored.

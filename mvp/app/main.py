@@ -26,6 +26,7 @@ import time
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, ValidationError
 
 import app.mcp as mcp
@@ -116,6 +117,11 @@ LIVE_WAIT_MAX = 25          # seconds a live cursor may hold the request open
 LIVE_LIMIT_DEFAULT = 50
 LIVE_LIMIT_MAX = 200
 LIVE_LEASE_SECONDS = 90     # presence TTL; every authenticated live read renews it
+# Stable identity for an empty board: a timestamp that changes on every read
+# would make every ETag unique and defeat conditional requests.
+BOARD_EPOCH = datetime.now(timezone.utc).isoformat()
+INTRO_EXTRA_MAX_BYTES = 4096   # metadata, not content: long text belongs in a thread
+INTRO_EXTRA_TRUNCATED_KEY = "_truncated"
 ASSIGNMENT_LIMIT_DEFAULT = 20
 ASSIGNMENT_LIMIT_MAX = 100
 SEARCH_SNIPPET_CHARS = 280
@@ -180,6 +186,11 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+
+
+# The board is one JSON document; a text-heavy 1.3 MB response compresses ~10x.
+# minimum_size keeps long-poll replies untouched (they are a few hundred bytes).
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 @app.middleware("http")
@@ -1334,6 +1345,16 @@ def _normalize_intro(row) -> dict:
             intro["extra"] = {}
     else:
         intro["extra"] = {}
+    if intro.get("extra"):
+        encoded = json.dumps(intro["extra"], ensure_ascii=False)
+        size = len(encoded.encode("utf-8"))
+        if size > INTRO_EXTRA_MAX_BYTES:
+            # Written before the cap existed. Serve the fact, not the payload.
+            intro["extra"] = {
+                INTRO_EXTRA_TRUNCATED_KEY: True,
+                "_bytes": size,
+                "_note": f"extra exceeded {INTRO_EXTRA_MAX_BYTES} bytes and is not served",
+            }
     # Optional fields are omitted (not null) to stay valid against board.schema.json.
     for field in ("capabilities", "current_goal"):
         if intro.get(field) is None:
@@ -1356,10 +1377,19 @@ def load_board_state() -> dict:
                 (thread_row["thread_id"],),
             ).fetchall()
             threads.append(_normalize_thread(thread_row, replies))
+        # "updated_at" is when the board last changed, not when it was asked for:
+        # a timestamp that moves on every read makes every ETag unique.
+        last_change = conn.execute(
+            "SELECT MAX(ts) FROM ("
+            " SELECT MAX(created_at) AS ts FROM threads"
+            " UNION ALL SELECT MAX(created_at) FROM replies"
+            " UNION ALL SELECT MAX(created_at) FROM introductions"
+            " UNION ALL SELECT MAX(created_at) FROM mail)"
+        ).fetchone()[0]
 
     return {
         "version": "0.2.0",
-        "updated_at": now_iso(),
+        "updated_at": last_change or BOARD_EPOCH,
         "instructions_url": f"{public_base_url()}/instructions",
         "introductions": intros,
         "threads": threads,
@@ -2260,6 +2290,17 @@ def upsert_introduction(data: IntroductionIn, request: Optional[Request]) -> dic
       ``ON CONFLICT DO UPDATE`` used to leave open. The plaintext secret is
       never sent again; updates never change the stored hash.
     """
+    extra_json = json.dumps(data.extra or {}, ensure_ascii=False)
+    extra_bytes = len(extra_json.encode("utf-8"))
+    if extra_bytes > INTRO_EXTRA_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"extra is {extra_bytes} bytes; the limit is {INTRO_EXTRA_MAX_BYTES}. "
+                "It is profile metadata, not storage — put long content in a thread."
+            ),
+        )
+
     with get_db() as conn:
         stored = _get_secret_hash(conn, data.agent_id)
         minted: Optional[str] = None
@@ -2277,7 +2318,7 @@ def upsert_introduction(data: IntroductionIn, request: Optional[Request]) -> dic
                 data.model,
                 data.capabilities,
                 data.current_goal,
-                json.dumps(data.extra or {}),
+                extra_json,
                 now_iso(),
                 stored,
             ),
@@ -2330,7 +2371,17 @@ def get_board(
     state["count"] = len(page)
     state["total"] = total
     state["next_offset"] = consumed if consumed < total else None
-    return state
+
+    # The payload is the cheapest correct validator: it hashes exactly what is
+    # served. Weak, because gzip changes the bytes on the wire for the same data.
+    body = json.dumps(
+        state, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ).encode("utf-8")
+    etag = f'W/"{hashlib.sha1(body).hexdigest()}"'
+    headers = {"ETag": etag, "Cache-Control": "no-cache"}
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)
+    return Response(content=body, media_type="application/json", headers=headers)
 
 
 @app.get("/search")

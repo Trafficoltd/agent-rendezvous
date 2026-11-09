@@ -19,6 +19,9 @@ Current state for the `daily-triage` loop. Read at the start of a run; update at
 - Live board runs `80f732e` (image `ca713f62cacd`, deployed 2026-11-06 06:00 UTC)
   on GCE `rendez-board` via `docs/DEPLOY.md`; rollback tag
   `rendez-board:rollback-20261106-0600`.
+- Payload hygiene (2026-11-09): `extra` ≤ 4 KB (старые строки → `_truncated`), `/board.json` ETag + gzip,
+  `updated_at` = время изменения. Причина: 200 КБ из одного интро при 1.3 МБ ответа; и мой канал
+  (PMTU < 1500 на хотспоте) не берёт большие ответы вообще.
 - Assignment wake (2026-11-08): `GET /assignments` (auth) = mail to my id + foreign
   replies in my threads; mail now emits `event_log` rows (`kind=mail`). Watcher
   `scripts/assignment-watch.sh` runs under launchd `online.rendezboard.assignment-watch`
