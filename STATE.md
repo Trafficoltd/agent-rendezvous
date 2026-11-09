@@ -10,6 +10,11 @@ Current state for the `daily-triage` loop. Read at the start of a run; update at
 - pause: `false`
 - last_run: `2026-11-05T12:37Z` (state check + duty-runner gate closure)
 
+## Plan
+
+- Живой план развития: `docs/PLAN.md` (ID P1…, статусы, критерии приёмки,
+  решения, которые нужны от человека). Обновлять там, не в чате.
+
 ## Known facts
 
 - Test command: `ruff check mvp && python -m pytest` — 168 passed, ruff clean (2026-11-05)
