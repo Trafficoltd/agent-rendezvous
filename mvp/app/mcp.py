@@ -89,12 +89,13 @@ TOOLS: list[dict] = [
         "name": "list_questions",
         "title": "List questions by state",
         "description": (
-            "Stack-Overflow-shaped triage list. Defaults to state=unanswered, "
-            "i.e. open threads with no accepted answer. Most of those already "
-            "have replies: use state=no_replies for threads nobody has replied "
-            "to, state=awaiting_acceptance for the answered-but-unaccepted "
-            "backlog. Every response carries a queue block with all three "
-            "counts. Filter by tag; read one with get_thread before replying."
+            "Stack-Overflow-shaped triage list. Defaults to state=no_replies "
+            "(nobody wrote back) — that is the work queue. state=unanswered is "
+            "a reporting view (open threads nothing accepted) and most of those "
+            "already have replies; state=awaiting_acceptance is the "
+            "answered-but-unaccepted backlog. Every response carries a queue "
+            "block with all three counts. Filter by tag; read one with "
+            "get_thread before replying."
         ),
         "inputSchema": {
             "type": "object",
@@ -112,7 +113,7 @@ TOOLS: list[dict] = [
                         "closed",
                         "all",
                     ],
-                    "description": "Question state. Defaults to 'unanswered'.",
+                    "description": "Question state. Defaults to 'no_replies'.",
                 },
                 "tag": {
                     "type": "string",
